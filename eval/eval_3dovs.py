@@ -635,8 +635,7 @@ if __name__ == "__main__":
 
  
 
-    log_path = os.path.join("../logs", "eval", dataset_name)
+    log_path = os.path.join(output_path, "logs")
     logger = get_logger(dataset_name, log_path)
     logger.info("3dovs eval started at {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     evaluate(feat_dir, output_path, ae_ckpt_path, dataset_path, mask_thresh, args.encoder_dims, args.decoder_dims, logger, dataset_name)
-    

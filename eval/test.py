@@ -22,19 +22,34 @@ from torch.utils.data import Dataset
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--output_path', type=str, default='~/LangSplat/output/bed')
+    parser.add_argument('--output_path', type=str, default=None)
     parser.add_argument('--dataset_name', type=str, default='bed')
-    parser.add_argument('--gt_path', type=str, default='/data2/jian/LangSplat/data/3dovs/bed/segmentations')
+    parser.add_argument('--gt_path', type=str, default=None)
+    parser.add_argument('--ae_checkpoint', type=str, default=None)
     parser.add_argument('--encoder_dims',nargs='+',type=int,default=[256, 128, 64, 32, 3],)
     parser.add_argument('--decoder_dims',nargs='+',type=int,default=[16, 32, 64, 128, 256, 256, 512],)
     args = parser.parse_args()
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    code_root = os.path.dirname(repo_root)
+    output_root = os.path.abspath(
+        os.environ.get("OUTPUT_ROOT", os.path.join(os.path.dirname(code_root), "Output"))
+    )
+    data_root = os.path.abspath(
+        os.environ.get("DATA_ROOT", os.path.join(os.path.dirname(code_root), "Data"))
+    )
+    if args.output_path is None:
+        args.output_path = os.path.join(output_root, "colasplat", "semantic", "3dovs")
+    if args.gt_path is None:
+        args.gt_path = os.path.join(data_root, "3dovs", args.dataset_name, "segmentations")
 
     dataset_name = args.dataset_name
     encoder_hidden_dims = args.encoder_dims
     decoder_hidden_dims = args.decoder_dims
     # ckpt_path = f"pretrained_model/autoencoder/sofa/best_ckpt.pth"
-    ckpt_path = f"~/LangSplat/autoencoder/ckpt/bed/best_ckpt.pth"
-    ckpt_path = os.path.expanduser(ckpt_path)
+    ckpt_path = args.ae_checkpoint or os.path.join(
+        output_root, "colasplat", "autoencoder", "ckpt", dataset_name, "best_ckpt.pth"
+    )
 
     # data_dir = f"{args.output_path}/train/ours_None/renders_npy"
     data_dir = f'{args.output_path}/{args.dataset_name}'
@@ -106,8 +121,9 @@ for idx, feature in tqdm(enumerate(test_loader)):
 
         gt_masks.append(gt_mask.cpu())
         relevancy_img = torchvision.transforms.ToPILImage()(relevancy_mask)
-        os.makedirs(f'render/{idx // 5}/sofa/{test_views_str[idx % len(test_views_str)]}', exist_ok=True)
-        relevancy_img.save(f'render/{idx // 5}/sofa/{test_views_str[idx % len(test_views_str)]}/{OpenCLIPNetworkConfig.positives[positive_id]}.png')
+        render_dir = os.path.join(output_dir, "scales", str(idx // 5), test_views_str[idx % len(test_views_str)])
+        os.makedirs(render_dir, exist_ok=True)
+        relevancy_img.save(os.path.join(render_dir, f"{OpenCLIPNetworkConfig.positives[positive_id]}.png"))
         # print(relevancy.shape)
         # print(gt_mask.shape)
         # miou = jaccard(relevancy.squeeze(0), gt_mask.unsqueeze(0))
@@ -142,12 +158,14 @@ for i in tqdm(range(num_imgs)):
         relevancy_mask = torch.nn.functional.interpolate(final_mask.unsqueeze(0).unsqueeze(0), gt_masks[i].shape,
                                                          mode='nearest')
         relevancy_img = torchvision.transforms.ToPILImage()(relevancy_mask.squeeze(0))
-        os.makedirs(f'render/sofa/{test_views_str[i % len(test_views_str)]}', exist_ok=True)
-        relevancy_img.save(f'render/sofa/{test_views_str[i % len(test_views_str)]}/{OpenCLIPNetworkConfig.positives[positive_id]}.png')
+        render_dir = os.path.join(output_dir, "pred", test_views_str[i % len(test_views_str)])
+        os.makedirs(render_dir, exist_ok=True)
+        relevancy_img.save(os.path.join(render_dir, f"{OpenCLIPNetworkConfig.positives[positive_id]}.png"))
 
         gt_img = torchvision.transforms.ToPILImage()(gt_masks[i*len(OpenCLIPNetworkConfig.positives) + positive_id].unsqueeze(0))
-        os.makedirs(f'render/gt/{test_views_str[i % len(test_views_str)]}', exist_ok=True)
-        gt_img.save(f'render/gt/{test_views_str[i % len(test_views_str)]}/{OpenCLIPNetworkConfig.positives[positive_id]}.png')
+        gt_dir = os.path.join(output_dir, "gt", test_views_str[i % len(test_views_str)])
+        os.makedirs(gt_dir, exist_ok=True)
+        gt_img.save(os.path.join(gt_dir, f"{OpenCLIPNetworkConfig.positives[positive_id]}.png"))
 
         miou = jaccard(relevancy_mask.squeeze(0), gt_masks[i*len(OpenCLIPNetworkConfig.positives) + positive_id].unsqueeze(0))
         acc = torch.sum(relevancy_mask.squeeze(0) == gt_masks[i*len(OpenCLIPNetworkConfig.positives) + positive_id].unsqueeze(0)) / (gt_masks[i*len(OpenCLIPNetworkConfig.positives) + positive_id].shape[0] * gt_masks[i*len(OpenCLIPNetworkConfig.positives) + positive_id].shape[1])

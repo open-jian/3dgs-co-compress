@@ -128,8 +128,9 @@ def get_latest_checkpoint(model_path, ckpt):
         print(f"Using latest checkpoint: {latest_ckpt}")
         return latest_ckpt
 
-def plot_opacity(gaussians, name):
-    makedirs("plot_opacity", exist_ok=True)
+def plot_opacity(gaussians, name, output_root):
+    opacity_dir = os.path.join(output_root, "plot_opacity")
+    makedirs(opacity_dir, exist_ok=True)
 
     opacity = gaussians.get_opacity  
     opacity = opacity.cpu().numpy()
@@ -141,7 +142,7 @@ def plot_opacity(gaussians, name):
     plt.title('Distribution of Opacity Values')
     plt.grid(True, linestyle='--', alpha=0.7)
 
-    plt.savefig(f'plot_opacity/{name}.png', dpi=100)  #
+    plt.savefig(os.path.join(opacity_dir, f"{name}.png"), dpi=100)  #
     plt.close()  
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, args):
@@ -156,7 +157,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, args, mode='test')
-        plot_opacity(gaussians,folder_name)
+        plot_opacity(gaussians, folder_name, scene.model_path)
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")

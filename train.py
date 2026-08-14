@@ -31,18 +31,25 @@ except ImportError:
     TENSORBOARD_FOUND = False
 import numpy as np
     
-def save_features_to_npy(language_feature, gt_language_feature, mask, image_name="sample"):
-    os.makedirs("feature_in_training", exist_ok=True)
+def workspace_output_root():
+    return os.path.abspath(
+        os.environ.get("OUTPUT_ROOT", os.path.join(os.path.dirname(__file__), "..", "..", "Output"))
+    )
+
+
+def save_features_to_npy(language_feature, gt_language_feature, mask, output_root, image_name="sample"):
+    debug_dir = os.path.join(output_root, "debug_features")
+    os.makedirs(debug_dir, exist_ok=True)
     print(f"shape of language_feature: {language_feature.shape}, gt_language_feature: {gt_language_feature.shape}, mask: {mask.shape}")
 
     masked_pred = (language_feature * mask).detach().cpu().numpy()
     masked_gt = (gt_language_feature * mask).detach().cpu().numpy()
 
 
-    np.save(f"feature_in_training/{image_name}_masked_pred.npy", masked_pred)
-    np.save(f"feature_in_training/{image_name}_masked_gt.npy", masked_gt)
+    np.save(os.path.join(debug_dir, f"{image_name}_masked_pred.npy"), masked_pred)
+    np.save(os.path.join(debug_dir, f"{image_name}_masked_gt.npy"), masked_gt)
 
-    print(f"Saved to feature_in_training/{image_name}_masked_pred.npy and _masked_gt.npy")
+    print(f"Saved debug features to {debug_dir}")
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, logger):
     checkpoint_iterations.append(opt.iterations)
@@ -115,7 +122,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gt_language_feature2, language_feature_mask2 = viewpoint_cam.get_language_feature(language_feature_dir=dataset.lf_path, feature_level=2)
             gt_language_feature3, language_feature_mask3 = viewpoint_cam.get_language_feature(language_feature_dir=dataset.lf_path, feature_level=3)
 
-            save_features_to_npy(language_feature, gt_language_feature, language_feature_mask, image_name=viewpoint_cam.image_name)
+            save_features_to_npy(
+                language_feature,
+                gt_language_feature,
+                language_feature_mask,
+                scene.model_path,
+                image_name=viewpoint_cam.image_name,
+            )
 
             Ll1 = l1_loss(language_feature1*language_feature_mask1, gt_language_feature1*language_feature_mask1)            
             Ll1_2 = l1_loss(language_feature2*language_feature_mask2, gt_language_feature2*language_feature_mask2)            
@@ -194,7 +207,7 @@ def prepare_output_and_logger(args):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+        args.model_path = os.path.join(workspace_output_root(), "colasplat", "runs", unique_str[0:10])
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
@@ -274,7 +287,7 @@ if __name__ == "__main__":
     safe_state(args.quiet)
     scene_name = os.path.basename(args.source_path.rstrip("/"))
 
-    log_path = os.path.join("./logs", "train", scene_name)
+    log_path = os.path.join(workspace_output_root(), "colasplat", "logs", "train", scene_name)
     logger = get_logger(scene_name, log_path)
     logger.info("Training started at {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 

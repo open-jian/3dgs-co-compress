@@ -452,7 +452,7 @@ if __name__ == "__main__":
     ae_ckpt_path = os.path.join(args.ae_ckpt_dir, dataset_name, "best_ckpt.pth")
     json_folder = os.path.join(args.json_folder, dataset_name)
 
-    log_path = os.path.join("../logs", "eval", dataset_name)
+    log_path = os.path.join(output_path, "logs")
     logger = get_logger(dataset_name, log_path)
     logger.info("lerf eval started at {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 

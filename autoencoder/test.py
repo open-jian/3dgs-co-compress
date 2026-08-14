@@ -10,12 +10,23 @@ from model import Autoencoder
 from datetime import datetime
 
 
+def default_checkpoint_root():
+    output_root = os.path.abspath(
+        os.environ.get(
+            "OUTPUT_ROOT",
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "Output"),
+        )
+    )
+    return os.path.join(output_root, "colasplat", "autoencoder", "ckpt")
+
+
 if __name__ == '__main__':
     now = datetime.now()
     print("Current date and time:", now)
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_path', type=str, required=True)
     parser.add_argument('--dataset_name', type=str, required=True)
+    parser.add_argument('--checkpoint_root', type=str, default=default_checkpoint_root())
     parser.add_argument('--encoder_dims',
                     nargs = '+',
                     type=int,
@@ -32,7 +43,7 @@ if __name__ == '__main__':
     encoder_hidden_dims = args.encoder_dims
     decoder_hidden_dims = args.decoder_dims
     dataset_path = args.dataset_path
-    ckpt_path = f"ckpt/{dataset_name}/best_ckpt.pth"
+    ckpt_path = os.path.join(args.checkpoint_root, dataset_name, "best_ckpt.pth")
 
     data_dir = f"{dataset_path}/language_features"
     output_dir = f"{dataset_path}/language_features_dim3"

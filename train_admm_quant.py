@@ -37,18 +37,25 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
     
-def save_features_to_npy(language_feature, gt_language_feature, mask, image_name="sample"):
-    os.makedirs("feature_in_training", exist_ok=True)
+def workspace_output_root():
+    return os.path.abspath(
+        os.environ.get("OUTPUT_ROOT", os.path.join(os.path.dirname(__file__), "..", "..", "Output"))
+    )
+
+
+def save_features_to_npy(language_feature, gt_language_feature, mask, output_root, image_name="sample"):
+    debug_dir = os.path.join(output_root, "debug_features")
+    os.makedirs(debug_dir, exist_ok=True)
     print(f"shape of language_feature: {language_feature.shape}, gt_language_feature: {gt_language_feature.shape}, mask: {mask.shape}")
     # use mask
     masked_pred = (language_feature * mask).detach().cpu().numpy()
     masked_gt = (gt_language_feature * mask).detach().cpu().numpy()
 
     # Construct save path
-    np.save(f"feature_in_training/{image_name}_masked_pred.npy", masked_pred)
-    np.save(f"feature_in_training/{image_name}_masked_gt.npy", masked_gt)
+    np.save(os.path.join(debug_dir, f"{image_name}_masked_pred.npy"), masked_pred)
+    np.save(os.path.join(debug_dir, f"{image_name}_masked_gt.npy"), masked_gt)
 
-    print(f"Saved to feature_in_training/{image_name}_masked_pred.npy and _masked_gt.npy")
+    print(f"Saved debug features to {debug_dir}")
 
 def training(dataset, opt : OptimizationParams, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, logger):
     checkpoint_iterations.append(opt.iterations)
@@ -188,9 +195,9 @@ def training(dataset, opt : OptimizationParams, pipe, testing_iterations, saving
         gt_language_feature2, language_feature_mask2 = viewpoint_cam.get_language_feature(language_feature_dir=dataset.lf_path, feature_level=2)
         gt_language_feature3, language_feature_mask3 = viewpoint_cam.get_language_feature(language_feature_dir=dataset.lf_path, feature_level=3)
         if viewpoint_cam.image_name in ["frame_00041","frame_00105","frame_00152","frame_00195"]:
-            save_features_to_npy(language_feature, gt_language_feature, language_feature_mask, image_name=f"iter_{iteration}_{viewpoint_cam.image_name}_lv1")
-            save_features_to_npy(language_feature, gt_language_feature, language_feature_mask, image_name=f"iter_{iteration}_{viewpoint_cam.image_name}_lv2")
-            save_features_to_npy(language_feature, gt_language_feature, language_feature_mask, image_name=f"iter_{iteration}_{viewpoint_cam.image_name}_lv3")
+            save_features_to_npy(language_feature, gt_language_feature, language_feature_mask, scene.model_path, image_name=f"iter_{iteration}_{viewpoint_cam.image_name}_lv1")
+            save_features_to_npy(language_feature, gt_language_feature, language_feature_mask, scene.model_path, image_name=f"iter_{iteration}_{viewpoint_cam.image_name}_lv2")
+            save_features_to_npy(language_feature, gt_language_feature, language_feature_mask, scene.model_path, image_name=f"iter_{iteration}_{viewpoint_cam.image_name}_lv3")
 
         Ll1_1 = l1_loss(language_feature*language_feature_mask, gt_language_feature*language_feature_mask)            
         Ll1_2 = l1_loss(language_feature2*language_feature_mask2, gt_language_feature2*language_feature_mask2)            
@@ -332,7 +339,7 @@ def prepare_output_and_logger(args):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+        args.model_path = os.path.join(workspace_output_root(), "colasplat", "admm_quant", "runs", unique_str[0:10])
         
     # Set up output folder
     logger.info("Output folder: {}".format(args.model_path))
@@ -433,7 +440,10 @@ if __name__ == "__main__":
     args.model_path = args.model_path
     print("Output:" + args.model_path)
     scene_name = os.path.basename(args.source_path.rstrip("/"))
-    logger = get_logger(scene_name, os.path.join("./logs", "train_admm_quant", scene_name))
+    logger = get_logger(
+        scene_name,
+        os.path.join(workspace_output_root(), "colasplat", "logs", "train_admm_quant", scene_name),
+    )
 
     # dataset_name = "lerf" #3dovs
     # config = load_config_with_scene(dataset_name, scene_name)

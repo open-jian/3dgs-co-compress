@@ -10,6 +10,17 @@ import argparse
 
 torch.autograd.set_detect_anomaly(True)
 
+
+def default_checkpoint_root():
+    output_root = os.path.abspath(
+        os.environ.get(
+            "OUTPUT_ROOT",
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "Output"),
+        )
+    )
+    return os.path.join(output_root, "colasplat", "autoencoder", "ckpt")
+
+
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 
@@ -33,11 +44,13 @@ if __name__ == '__main__':
                     default=[16, 32, 64, 128, 256, 256, 512],
                     )
     parser.add_argument('--dataset_name', type=str, required=True)
+    parser.add_argument('--checkpoint_root', type=str, default=default_checkpoint_root())
     args = parser.parse_args()
     dataset_path = args.dataset_path
     num_epochs = args.num_epochs
     data_dir = f"{dataset_path}/language_features"
-    os.makedirs(f'ckpt/{args.dataset_name}', exist_ok=True)
+    checkpoint_dir = os.path.join(args.checkpoint_root, args.dataset_name)
+    os.makedirs(checkpoint_dir, exist_ok=True)
     train_dataset = Autoencoder_dataset(data_dir)
     train_loader = DataLoader(
         dataset=train_dataset,
@@ -61,7 +74,7 @@ if __name__ == '__main__':
     model = Autoencoder(encoder_hidden_dims, decoder_hidden_dims).to('cuda')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    logdir = f'ckpt/{args.dataset_name}'
+    logdir = checkpoint_dir
     # tb_writer = SummaryWriter(logdir)
 
     best_eval_loss = 100.0
@@ -101,10 +114,10 @@ if __name__ == '__main__':
             if eval_loss < best_eval_loss:
                 best_eval_loss = eval_loss
                 best_epoch = epoch
-                torch.save(model.state_dict(), f'ckpt/{args.dataset_name}/best_ckpt.pth')
+                torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'best_ckpt.pth'))
 
             if epoch % 10 == 0:
-                torch.save(model.state_dict(), f'ckpt/{args.dataset_name}/{epoch}_ckpt.pth')
+                torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'{epoch}_ckpt.pth'))
             
     print(f"best_epoch: {best_epoch}")
     print("best_loss: {:.8f}".format(best_eval_loss))
