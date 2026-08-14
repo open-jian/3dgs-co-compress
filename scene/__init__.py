@@ -39,22 +39,17 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
-        print(f"start to load scene from {args.source_path}")
+
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
         else:
-            assert False, f"Could not recognize scene type! source_path: {args.source_path}"
-        print(f"finish load scene from {args.source_path}")
-
+            print(args.source_path)
+            assert False, "Could not recognize scene type!"
 
         if not self.loaded_iter:
-            # 如果没有输入loaded_iter 说明是第一次训练
-            dest_path = os.path.join(self.model_path, "input.ply")
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            # 把dataset的 .ply 文件复制一份，重命名为 input.ply，保存到目标路径中。
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
                 dest_file.write(src_file.read())
             json_cams = []

@@ -56,40 +56,38 @@ class Camera(nn.Module):
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
     def get_language_feature(self, language_feature_dir, feature_level):
+        return self.get_language_features(language_feature_dir, [feature_level])[0]
+
+    def get_language_features(self, language_feature_dir, feature_levels=(1, 2, 3)):
+        """Load several semantic scales with a single pair of NumPy reads."""
         language_feature_name = os.path.join(language_feature_dir, self.image_name)
         seg_map = torch.from_numpy(np.load(language_feature_name + '_s.npy'))
         feature_map = torch.from_numpy(np.load(language_feature_name + '_f.npy'))
         
-        # elif str(language_feature_name).split('.')[-1] == 'pkl':
-        #     with open(language_feature_name, 'rb') as f:
-        #         data = pickle.load(f)
-        #     seg_map = data['seg_maps']
-        #     feature_tensor = data['feature']
-        # print(seg_map.shape, feature_tensor.shape)torch.Size([4, 832, 1264]) torch.Size([391, 512])
-        # feature_map = torch.zeros(512, self.image_height, self.image_width)
         y, x = torch.meshgrid(torch.arange(0, self.image_height), torch.arange(0, self.image_width))
         x = x.reshape(-1, 1)
         y = y.reshape(-1, 1)
         seg = seg_map[:, y, x].squeeze(-1).long()
-        mask = seg != -1
-        if feature_level == 0: # default
-            point_feature1 = feature_map[seg[0:1]].squeeze(0)
-            mask = mask[0:1].reshape(1, self.image_height, self.image_width)
-        elif feature_level == 1: # s
-            point_feature1 = feature_map[seg[1:2]].squeeze(0)
-            mask = mask[1:2].reshape(1, self.image_height, self.image_width)
-        elif feature_level == 2: # m
-            point_feature1 = feature_map[seg[2:3]].squeeze(0)
-            mask = mask[2:3].reshape(1, self.image_height, self.image_width)
-        elif feature_level == 3: # l
-            point_feature1 = feature_map[seg[3:4]].squeeze(0)
-            mask = mask[3:4].reshape(1, self.image_height, self.image_width)
-        else:
-            raise ValueError("feature_level=", feature_level)
-        # point_feature = torch.cat((point_feature2, point_feature3, point_feature4), dim=-1).to('cuda')
-        point_feature = point_feature1.reshape(self.image_height, self.image_width, -1).permute(2, 0, 1)
-        # point_feature.shape = (num_features, image_height, image_width) num_features = 512
-        return point_feature.cuda(), mask.cuda()
+        valid = seg != -1
+        outputs = []
+        for feature_level in feature_levels:
+            if feature_level < 0 or feature_level >= seg.shape[0]:
+                raise ValueError("feature_level={}".format(feature_level))
+
+            level_seg = seg[feature_level]
+            level_mask = valid[feature_level].reshape(
+                1, self.image_height, self.image_width
+            )
+            # ``-1`` indexes the last row in PyTorch.  Those values are masked
+            # out below, so clamp them to zero to make the invalid lookup
+            # explicit and safe even when the feature array is empty/small.
+            safe_seg = level_seg.clamp_min(0)
+            point_feature = feature_map[safe_seg]
+            point_feature = point_feature.reshape(
+                self.image_height, self.image_width, -1
+            ).permute(2, 0, 1)
+            outputs.append((point_feature.cuda(), level_mask.cuda()))
+        return outputs
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
@@ -103,4 +101,3 @@ class MiniCam:
         self.full_proj_transform = full_proj_transform
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
-

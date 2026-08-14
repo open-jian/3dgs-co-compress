@@ -110,3 +110,30 @@ class OpenCLIPNetwork:
         
         relev_map = torch.stack(n_levels_sims).view(n_levels, n_phrases, h, w)
         return relev_map
+    
+    def get_max_across_quick(self, sem_map):
+        """
+        sem_map: [n_levels, H, W, 512]
+        Output: [n_levels, n_phrases, H, W]
+        """
+        device = sem_map.device
+        n_levels, h, w, c = sem_map.shape
+        n_phrases = len(self.positives)
+        n_negatives = len(self.negatives)
+
+        sem_map_flat = sem_map.permute(0, 3, 1, 2).reshape(n_levels, c, -1)  # [n_levels, 512, H*W]
+        sem_map_flat = sem_map_flat.permute(0, 2, 1).contiguous()  # [n_levels, H*W, 512]
+
+        phrase_embeds = torch.cat([self.pos_embeds, self.neg_embeds], dim=0).to(sem_map.dtype).to(device)  # [P+N, 512]
+        sim = torch.einsum('nqc,pc->nqp', sem_map_flat, phrase_embeds)  # [n_levels, H*W, P+N]
+        pos_vals = sim[:, :, :n_phrases]  # [n_levels, H*W, P]
+        neg_vals = sim[:, :, n_phrases:]  # [n_levels, H*W, N]
+
+        repeated_pos = pos_vals.unsqueeze(-1).repeat(1, 1, 1, n_negatives)  # [n_levels, H*W, P, N]
+        neg_vals_exp = neg_vals.unsqueeze(2).repeat(1, 1, n_phrases, 1)     # [n_levels, H*W, P, N]
+
+        sims = torch.stack([repeated_pos, neg_vals_exp], dim=-1)  # [n_levels, H*W, P, N, 2]
+        softmax = torch.softmax(10 * sims, dim=-1)  # [n_levels, H*W, P, N, 2]
+        min_pos_prob, _ = softmax[..., 0].min(dim=-1)  # [n_levels, H*W, P]
+        relev_map = min_pos_prob.permute(0, 2, 1).reshape(n_levels, n_phrases, h, w)  # [n_levels, P, H, W]
+        return relev_map

@@ -154,15 +154,6 @@ def create(image_list, data_list, save_folder):
             v[v != -1] += lengths_cumsum[j-1]
             seg_map_tensor.append(torch.from_numpy(v))
         seg_map = torch.stack(seg_map_tensor, dim=0)
-        if 'room' in save_folder and i in [0,4,25]:
-            print(f"⚠️ Correct {i}")
-            layer = seg_map[3, :, :]
-            unique_vals = np.unique(layer)
-            if i in [0, 4]:
-                layer[layer == unique_vals[-2]] = unique_vals[-3]
-            if i in [25]:
-                layer[layer == unique_vals[-3]] = unique_vals[-1]
-            seg_map[3, :, :] = layer
         seg_maps[i] = seg_map
 
     mask_generator.predictor.model.to('cpu')
@@ -239,24 +230,26 @@ def mask_nms(masks, scores, iou_thr=0.7, score_thr=0.1, inner_thr=0.2, **kwargs)
     scores, idx = scores.sort(0, descending=True)
     num_masks = idx.shape[0]
     
-    masks_ord = masks[idx.view(-1), :]
-    masks_area = torch.sum(masks_ord, dim=(1, 2), dtype=torch.float)
+    # The released implementation computed all pairwise intersections in
+    # nested Python loops.  This matrix product is mathematically equivalent
+    # at the supported image sizes and makes the four-level preprocessing
+    # tractable without changing the selected masks.
+    compute_device = torch.device("cuda" if torch.cuda.is_available() else masks.device)
+    masks_ord = masks[idx.view(-1), :].to(device=compute_device, dtype=torch.float32)
+    masks_flat = masks_ord.flatten(1)
+    masks_area = masks_flat.sum(dim=1)
+    intersection = masks_flat @ masks_flat.transpose(0, 1)
+    union = masks_area[:, None] + masks_area[None, :] - intersection
+    iou_matrix = intersection / union.clamp_min(1.0)
 
-    iou_matrix = torch.zeros((num_masks,) * 2, dtype=torch.float, device=masks.device)
-    inner_iou_matrix = torch.zeros((num_masks,) * 2, dtype=torch.float, device=masks.device)
-    for i in range(num_masks):
-        for j in range(i, num_masks):
-            intersection = torch.sum(torch.logical_and(masks_ord[i], masks_ord[j]), dtype=torch.float)
-            union = torch.sum(torch.logical_or(masks_ord[i], masks_ord[j]), dtype=torch.float)
-            iou = intersection / union
-            iou_matrix[i, j] = iou
-            # select mask pairs that may have a severe internal relationship
-            if intersection / masks_area[i] < 0.5 and intersection / masks_area[j] >= 0.85:
-                inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
-                inner_iou_matrix[i, j] = inner_iou
-            if intersection / masks_area[i] >= 0.85 and intersection / masks_area[j] < 0.5:
-                inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
-                inner_iou_matrix[j, i] = inner_iou
+    fraction_of_row = intersection / masks_area[:, None].clamp_min(1.0)
+    fraction_of_col = intersection / masks_area[None, :].clamp_min(1.0)
+    inner_condition = (fraction_of_row < 0.5) & (fraction_of_col >= 0.85)
+    inner_iou_matrix = torch.where(
+        inner_condition,
+        1 - fraction_of_row * fraction_of_col,
+        torch.zeros_like(intersection),
+    )
 
     iou_matrix.triu_(diagonal=1)
     iou_max, _ = iou_matrix.max(dim=0)
@@ -266,6 +259,7 @@ def mask_nms(masks, scores, iou_thr=0.7, score_thr=0.1, inner_thr=0.2, **kwargs)
     inner_iou_max_l, _ = inner_iou_matrix_l.max(dim=0)
     
     keep = iou_max <= iou_thr
+    scores = scores.to(compute_device)
     keep_conf = scores > score_thr
     keep_inner_u = inner_iou_max_u <= 1 - inner_thr
     keep_inner_l = inner_iou_max_l <= 1 - inner_thr
@@ -284,7 +278,7 @@ def mask_nms(masks, scores, iou_thr=0.7, score_thr=0.1, inner_thr=0.2, **kwargs)
     keep *= keep_inner_u
     keep *= keep_inner_l
 
-    selected_idx = idx[keep]
+    selected_idx = idx.to(compute_device)[keep].cpu()
     return selected_idx
 
 def masks_update(*args, **kwargs):
@@ -407,7 +401,7 @@ if __name__ == '__main__':
         img_list.append(image)
     images = [img_list[i].permute(2, 0, 1)[None, ...] for i in range(len(img_list))]
     imgs = torch.cat(images)
+
     save_folder = os.path.join(dataset_path, 'language_features')
     os.makedirs(save_folder, exist_ok=True)
-
     create(imgs, data_list, save_folder)

@@ -8,10 +8,12 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+
 import os
 import torch
+import torch.nn as nn
 from random import randint
-from utils.loss_utils import l1_loss,  ssim
+from utils.loss_utils import l1_loss, ssim, cos_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -21,31 +23,23 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from datetime import datetime
-from logger import get_logger
-
+from utils.vq_utils import load_2d_language_feature, ResidualVectorQuantizationWithClustering
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
-import numpy as np
-    
-def save_features_to_npy(language_feature, gt_language_feature, mask, image_name="sample"):
-    os.makedirs("feature_in_training", exist_ok=True)
-    print(f"shape of language_feature: {language_feature.shape}, gt_language_feature: {gt_language_feature.shape}, mask: {mask.shape}")
 
-    masked_pred = (language_feature * mask).detach().cpu().numpy()
-    masked_gt = (gt_language_feature * mask).detach().cpu().numpy()
+import matplotlib.pyplot as plt
 
 
-    np.save(f"feature_in_training/{image_name}_masked_pred.npy", masked_pred)
-    np.save(f"feature_in_training/{image_name}_masked_gt.npy", masked_gt)
+def workspace_output_root():
+    return os.path.abspath(
+        os.environ.get("OUTPUT_ROOT", os.path.join(os.path.dirname(__file__), "..", "..", "Output"))
+    )
 
-    print(f"Saved to feature_in_training/{image_name}_masked_pred.npy and _masked_gt.npy")
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, logger):
-    checkpoint_iterations.append(opt.iterations)
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -60,6 +54,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if len(model_params) == 12 and opt.include_feature:
             first_iter = 0
         gaussians.restore(model_params, opt)
+    
+    # Initialize language feature codebooks
+    if opt.include_feature and first_iter == 0:
+        device = torch.device("cuda")
+        features = load_2d_language_feature(dataset.lf_path, device)
+        rvq = ResidualVectorQuantizationWithClustering(opt.vq_layer_num, opt.codebook_size, features.shape[1], device).to(device)
+        rvq.fit_quantizers(features)
+        codebooks = torch.stack(rvq.quantizers, dim=0).to(device)
+        with torch.no_grad():
+            gaussians._language_feature_codebooks.data.copy_(codebooks)
+
         
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -69,11 +74,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
-    ema_loss_level1 = 0.0
-    ema_loss_level2 = 0.0
-    ema_loss_level3 = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    loss_record = []
+    iter_record = []
+    smooth_loss = None
     for iteration in range(first_iter, opt.iterations + 1):        
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -106,55 +111,55 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
+        opt.topk = args.topk
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, opt)
-        image, language_feature1, language_feature2, language_feature3, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["language_feature_image1"], render_pkg["language_feature_image2"], render_pkg["language_feature_image3"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        Ll1 = Ll1_2 = Ll1_3 = 0
+        image, language_feature_weight_map, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["language_feature_weight_map"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        
         # Loss
         if opt.include_feature:
-            gt_language_feature1, language_feature_mask1 = viewpoint_cam.get_language_feature(language_feature_dir=dataset.lf_path, feature_level=1)
-            gt_language_feature2, language_feature_mask2 = viewpoint_cam.get_language_feature(language_feature_dir=dataset.lf_path, feature_level=2)
-            gt_language_feature3, language_feature_mask3 = viewpoint_cam.get_language_feature(language_feature_dir=dataset.lf_path, feature_level=3)
+            # gt_language_feature [512 H W]
+            gt_language_feature, language_feature_mask = viewpoint_cam.get_language_feature(language_feature_dir=dataset.lf_path, feature_level=dataset.feature_level)
+            # In this paper, we select layer_num = 1
+            layer_num, _, _ = gaussians.get_language_feature_codebooks.shape
+            layer_idx = min(int(iteration / 10000 * layer_num), layer_num - 1)
+            language_feature = gaussians.compute_layer_feature_map(language_feature_weight_map, layer_idx)
+            if args.normalize:
+                language_feature = language_feature / (language_feature.norm(dim=0, keepdim=True) + 1e-10)
+            loss = 0
+            if args.cos_loss:
+                cosloss = cos_loss(language_feature*language_feature_mask, gt_language_feature*language_feature_mask)
+                loss += cosloss
+            if args.l1_loss:
+                Ll1 = l1_loss(language_feature*language_feature_mask, gt_language_feature*language_feature_mask)   
+                loss += Ll1
 
-            save_features_to_npy(language_feature, gt_language_feature, language_feature_mask, image_name=viewpoint_cam.image_name)
-
-            Ll1 = l1_loss(language_feature1*language_feature_mask1, gt_language_feature1*language_feature_mask1)            
-            Ll1_2 = l1_loss(language_feature2*language_feature_mask2, gt_language_feature2*language_feature_mask2)            
-            Ll1_3 = l1_loss(language_feature3*language_feature_mask3, gt_language_feature3*language_feature_mask3)            
-
-            loss = Ll1 + Ll1_2 + Ll1_3
         else:
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss.backward()
         iter_end.record()
+        
+        iter_record.append(iteration)
+        if smooth_loss is None:
+            smooth_loss = loss.item()
+        else:
+            smooth_loss = smooth_loss * 0.99 + loss.item() * 0.01
+        loss_record.append(smooth_loss)
+
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            ema_loss_level1 = 0.4 * Ll1.item() + 0.6 * ema_loss_level1
-            ema_loss_level2 = 0.4 * Ll1_2.item() + 0.6 * ema_loss_level2
-            ema_loss_level3 = 0.4 * Ll1_3.item() + 0.6 * ema_loss_level3
-
-            
             if iteration % 10 == 0:
-                # progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}","lv1": f"{ema_loss_level1:.{7}f}","lv2": f"{ema_loss_level2:.{7}f}","lv3": f"{ema_loss_level3:.{7}f}"})
-                # progress_bar.update(10)
-                log_info = {"iter":iteration,
-                            "loss": round(ema_loss_for_log, 7),
-                            "lv1": round(ema_loss_level1, 7),
-                            "lv2": round(ema_loss_level2, 7),
-                            "lv3": round(ema_loss_level3, 7),
-                            "point": gaussians._xyz.shape[0]
-                        }
-                logger.info(log_info)
-
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, opt))
+            # training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, opt))
             if (iteration in saving_iterations):
-                logger.info(f"Ply saved in iter {iteration}")
+                print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
             # Densification
@@ -172,21 +177,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.reset_opacity()
 
             # Optimizer step
-            if iteration < opt.iterations:
+            if (iteration < opt.iterations) and (iteration % args.accum_iter == 0):
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
-            
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(opt.include_feature), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-                logger.info(f"[checkpoint_iterations {iteration}] Saving Gaussians in {scene.model_path}")
-
-
-    torch.save((gaussians.capture(opt.include_feature), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-
- 
-    scene.save(iteration)
+                if iteration == 10000:
+                    # Reproduction instrumentation only; these counters do
+                    # not synchronize or modify model/optimizer state.
+                    print("CUDA max memory allocated bytes: {}".format(
+                        torch.cuda.max_memory_allocated()
+                    ))
+                    print("CUDA max memory reserved bytes: {}".format(
+                        torch.cuda.max_memory_reserved()
+                    ))
+                    return
             
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -194,7 +201,7 @@ def prepare_output_and_logger(args):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+        args.model_path = os.path.join(workspace_output_root(), "langsplatv2_cluno", "runs", unique_str[0:10])
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
@@ -243,9 +250,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
-        # if tb_writer:
-        #     tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-        #     tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        if tb_writer:
+            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
@@ -255,35 +262,31 @@ if __name__ == "__main__":
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.1")
-    parser.add_argument('--port', type=int, default=55555)
+    parser.add_argument('--port', type=int, default=55557)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[2000, 4000, 6000, 8000, 10_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[2000, 4000, 6000, 8000, 10_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int,  default=[30_000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[2000, 4000, 6000, 8000, 10_000, 30_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-
+    parser.add_argument('--cos_loss', action='store_true', default=False)
+    parser.add_argument('--l1_loss', action='store_true', default=False)
+    parser.add_argument('--normalize', action='store_true', default=False)
+    parser.add_argument('--accum_iter', type=int, default=1)
+    parser.add_argument('--topk', type=int, default=1)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     print(args)
-    print("The output model (pth & ply) will saved in: " + args.model_path)
-
+    args.model_path = args.model_path + f"_{str(args.feature_level)}"
+    print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
-    scene_name = os.path.basename(args.source_path.rstrip("/"))
-
-    log_path = os.path.join("./logs", "train", scene_name)
-    logger = get_logger(scene_name, log_path)
-    logger.info("Training started at {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-
 
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, logger)
-
-
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
     # All done
     print("\nTraining complete.")

@@ -1,139 +1,138 @@
+"""ADMM pruning and SH projection adapted from CoLaSplat for LangSplatV2.
+
+The semantic representation is already vector-quantized by LangSplatV2.  The
+second ADMM constraint therefore remains on RGB spherical-harmonic attributes,
+while the first constraint sparsifies opacity.  All semantic heads are pruned
+later with exactly the same Gaussian mask by ``GaussianModel.prune_points_admm``.
+"""
 
 import torch
-import fnmatch
-import numpy as np
-import os
-from scene_admm import GaussianModel
-#os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
-#  # Alternating Direction Method of Multipliers (ADMM) optimization algorithm, usually used to solve optimization problems with constraints and regularization.
-class ADMM:
-    def __init__(self, gsmodel: GaussianModel, rho1, rho2, device):
-        self.gsmodel = gsmodel 
-        self.device = device # Specify where tensors are stored (CPU or GPU)
-        self.init_rho1 = rho1 # Scalar, used for the penalty term in ADMM
-        self.init_rho2 = rho2 #
-
-        # u and z are auxiliary variables (dual variables) in the ADMM algorithm
-        self.u1 = {}
-        self.u2 = {}
-        self.z2 = {}
-        self.z1 = {}
-
-        self.rho1 = self.init_rho1
-        self.rho2 = self.init_rho2
-
-        opacity = self.gsmodel.get_opacity
-        sh = self.gsmodel._features_rest
-
-        self.u1 = torch.zeros(opacity.shape).to(device)
-        self.z1 = torch.Tensor(opacity.data.cpu().clone().detach()).to(device)
-        self.u2 = torch.zeros(sh.shape).to(device)
-        self.z2 = torch.Tensor(sh.data.cpu().clone().detach()).to(device)
-
-    # Use Lagrange multipliers u to gradually approximate the consistency of x and z
-    def update1(self, threshold, update_u = True):
-        # 1. The input to compute z is equivalent to the original variable + the Lagrange multiplier λ
-        z = self.gsmodel.get_opacity + self.u1
-
-        # 2. Update z to satisfy the constraints (this is cropping/sparse operations)  
-        self.z1 = torch.Tensor(self.prune_z(z, threshold)).to(self.device)
-        
-        # 3. Update the Lagrange multiplier λ(u1) to gradually penalize the gap between the original variable and the auxiliary variable, promoting the convergence of the two
-        if update_u: 
-            with torch.no_grad():
-                diff =  self.gsmodel.get_opacity - self.z1
-                self.u1 += diff
-
-    def update2(self, kmeans_sh_q, update_u=True, assign = True, update_center = True):
-
-        if kmeans_sh_q.vec_dim == 0:
-            kmeans_sh_q.vec_dim = self.gsmodel._features_rest.shape[1] * self.gsmodel._features_rest.shape[2]
 
 
-        # x + u
-        z_input = self.gsmodel._features_rest + self.u2
-        feat = z_input.reshape(-1, kmeans_sh_q.vec_dim)  #  (N, D)
-
-        # Step 1: Find the nearest cluster center index for each sample point (cluster assignment
-        kmeans_sh_q.update_centers(self.gsmodel._features_rest)
-        kmeans_sh_q.cluster_assign(feat)  # update kmeans_sh_q.nn_index
-        
-        # Step 2: Get the quantized center vector according to the index (projection operation)
-        indices = kmeans_sh_q.nn_index.long()
-        centers = kmeans_sh_q.centers  # Codebook Center
-        quantized_values = centers[indices]  # (N, vec_dim)
-
-        # Step 3: Reshape it back and update the auxiliary variable z
-        self.z2 = quantized_values.reshape(z_input.shape).to(self.device)
-
-        # Step 4: Update the dual variable 
-        if update_u:
-            with torch.no_grad():
-                diff = self.gsmodel._features_rest - self.z2
-                self.u2 += diff
-
-
-
-    #  
-    def prune_z(self, z, threshold):
-        z_update = self.metrics_sort(z, threshold)  
-        return z_update
-    
-
-    # 
-    def get_admm_loss_1(self): 
-        return 0.5 * self.rho1 * (torch.norm(self.gsmodel.get_opacity - self.z1 + self.u1, p=2)) ** 2
-    
-    #
-    def get_admm_loss_2(self): 
-        return 0.5 * self.rho2 * (torch.norm(self.gsmodel._features_rest - self.z2 + self.u2, p=2)) ** 2
-
-    # Adjust the rho value based on the current progress of training (epoch and epochs). 
-    # Typically, rho will increase as training progresses, increasing the penalty on the constraint.
-    def adjust_rho(self, epoch, epochs, factor=5): 
-        if epoch > int(0.85 * epochs):
-            self.rho1 = factor * self.init_rho1
-    
-    def metrics_sort(self, z, threshold): 
-        index = int(threshold * len(z))
-        z_sort = {}
-        z_update = torch.zeros(z.shape)
-        z_sort, _ = torch.sort(z, 0)
-        z_threshold = z_sort[index-1]
-        z_update= ((z > z_threshold) * z)  
-        return z_update
-    
-    def metrics_sample(self, z, opt): 
-        index = int((1 - opt.pruning_threshold) * len(z))
-        prob = z / torch.sum(z)
-        prob = prob.reshape(-1).cpu().numpy()
-        indices = torch.tensor(np.random.choice(len(z), index, p = prob, replace=False))
-        expand_indices = torch.zeros(z.shape[0] - len(indices)).int()
-        indices = torch.cat((indices, expand_indices),0).to(self.device)
-        z_update = torch.zeros(z.shape).to(self.device)
-        z_update[indices] = z[indices]
-        return z_update
-
-    def metrics_imp_score(self, z, imp_score, opt): 
-        index = int(opt.pruning_threshold * len(z))
-        imp_score_sort = {}
-        imp_score_sort, _ = torch.sort(imp_score, 0)
-        imp_score_threshold = imp_score_sort[index-1]
-        indices = imp_score < imp_score_threshold 
-        z[indices == 1] = 0  
-        return z        
-
-
-
-def get_unactivate_opacity(gaussians):
-    opacity = gaussians._opacity[:, 0]
-    scores = opacity
-    return scores
-
-def get_pruning_mask(scores, threshold):        
-    scores_sorted, _ = torch.sort(scores, 0)
-    threshold_idx = int(threshold * len(scores_sorted))
-    abs_threshold = scores_sorted[threshold_idx - 1]
-    mask = (scores <= abs_threshold).squeeze()
+def get_pruning_mask(scores, pruning_fraction):
+    """Return an exact-size mask for the lowest-scoring Gaussian points."""
+    if not 0.0 <= pruning_fraction < 1.0:
+        raise ValueError("pruning_fraction must be in [0, 1)")
+    scores = scores.reshape(-1)
+    prune_count = int(pruning_fraction * scores.numel())
+    mask = torch.zeros_like(scores, dtype=torch.bool)
+    if prune_count:
+        indices = torch.topk(scores, prune_count, largest=False, sorted=False).indices
+        mask[indices] = True
     return mask
+
+
+class SHKMeansProjector:
+    """Chunked GPU k-means projection for one SH vector per Gaussian."""
+
+    def __init__(self, num_clusters, chunk_size=4096):
+        if num_clusters <= 0:
+            raise ValueError("num_clusters must be positive")
+        self.requested_clusters = num_clusters
+        self.chunk_size = chunk_size
+        self.centers = None
+        self.assignments = None
+        self.feature_shape = None
+
+    @staticmethod
+    def _flatten(features):
+        return features.detach().reshape(features.shape[0], -1).float()
+
+    def _assign(self, features):
+        assignments = []
+        for start in range(0, features.shape[0], self.chunk_size):
+            chunk = features[start:start + self.chunk_size]
+            distances = torch.cdist(chunk, self.centers)
+            assignments.append(distances.argmin(dim=1))
+        return torch.cat(assignments, dim=0)
+
+    def _update_centers(self, features, assignments):
+        cluster_count = self.centers.shape[0]
+        sums = torch.zeros_like(self.centers)
+        sums.scatter_add_(
+            0, assignments[:, None].expand(-1, features.shape[1]), features
+        )
+        counts = torch.bincount(assignments, minlength=cluster_count).to(features.dtype)
+        nonempty = counts > 0
+        updated = self.centers.clone()
+        updated[nonempty] = sums[nonempty] / counts[nonempty, None]
+        self.centers = updated
+
+    def project(self, features, update_centers=True):
+        flattened = self._flatten(features)
+        self.feature_shape = tuple(features.shape[1:])
+        if self.centers is None:
+            cluster_count = min(self.requested_clusters, flattened.shape[0])
+            sample_indices = torch.randperm(
+                flattened.shape[0], device=flattened.device
+            )[:cluster_count]
+            self.centers = flattened[sample_indices].clone()
+
+        assignments = self._assign(flattened)
+        if update_centers:
+            self._update_centers(flattened, assignments)
+            assignments = self._assign(flattened)
+        self.assignments = assignments
+        return self.centers[assignments].reshape_as(features)
+
+    def prune(self, mask):
+        if self.assignments is not None:
+            self.assignments = self.assignments[~mask]
+
+    def state_dict(self):
+        if self.centers is None or self.assignments is None:
+            raise RuntimeError("SH quantizer has not been initialized")
+        return {
+            "centers": self.centers.detach().cpu(),
+            "indices": self.assignments.detach().to(torch.int32).cpu(),
+            "feature_shape": self.feature_shape,
+        }
+
+
+class ADMM:
+    """Two-constraint ADMM state for opacity sparsity and SH quantization."""
+
+    def __init__(self, gaussian_model, rho_opacity, rho_sh, sh_clusters, device="cuda"):
+        self.gaussian_model = gaussian_model
+        self.device = torch.device(device)
+        self.rho_opacity = rho_opacity
+        self.rho_sh = rho_sh
+        self.u_opacity = torch.zeros_like(gaussian_model.get_opacity, device=self.device)
+        self.z_opacity = gaussian_model.get_opacity.detach().clone()
+        self.u_sh = torch.zeros_like(gaussian_model._features_rest, device=self.device)
+        self.z_sh = gaussian_model._features_rest.detach().clone()
+        self.sh_projector = SHKMeansProjector(sh_clusters)
+
+    @torch.no_grad()
+    def update_opacity(self, pruning_fraction, update_dual=True):
+        value = self.gaussian_model.get_opacity + self.u_opacity
+        prune_mask = get_pruning_mask(value[:, 0], pruning_fraction)
+        self.z_opacity = value.clone()
+        self.z_opacity[prune_mask] = 0
+        if update_dual:
+            self.u_opacity.add_(self.gaussian_model.get_opacity - self.z_opacity)
+
+    @torch.no_grad()
+    def update_sh(self, update_dual=True, update_centers=True):
+        value = self.gaussian_model._features_rest + self.u_sh
+        self.z_sh = self.sh_projector.project(value, update_centers=update_centers)
+        if update_dual:
+            self.u_sh.add_(self.gaussian_model._features_rest - self.z_sh)
+
+    def opacity_loss(self):
+        residual = self.gaussian_model.get_opacity - self.z_opacity + self.u_opacity
+        return 0.5 * self.rho_opacity * residual.square().sum()
+
+    def sh_loss(self):
+        residual = self.gaussian_model._features_rest - self.z_sh + self.u_sh
+        return 0.5 * self.rho_sh * residual.square().sum()
+
+    @torch.no_grad()
+    def prune(self, mask):
+        valid = ~mask
+        self.u_opacity = self.u_opacity[valid]
+        self.z_opacity = self.z_opacity[valid]
+        self.u_sh = self.u_sh[valid]
+        self.z_sh = self.z_sh[valid]
+        self.sh_projector.prune(mask)
 

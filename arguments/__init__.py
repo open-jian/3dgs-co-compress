@@ -49,7 +49,7 @@ class ModelParams(ParamGroup):
         self.sh_degree = 3
         self._source_path = ""
         self._model_path = "" 
-        self._language_features_name = "language_features_dim3"
+        self._language_features_name = "language_features"
         self._images = "images"
         self._resolution = -1
         self._white_background = False
@@ -82,6 +82,11 @@ class OptimizationParams(ParamGroup):
         self.opacity_lr = 0.05
         self.language_feature_lr = 0.0025 # TODO: update
         self.include_feature = True # Set to False if train the original gs
+        self.quick_render = False
+        self.vq_layer_num = 1
+        self.codebook_size = 64
+        self.semantic_level_num = 1
+        self.joint_optimize = False
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
@@ -91,6 +96,26 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+        # CoLaSplat-style joint optimization/compression stage.  These options
+        # are consumed by train_joint.py and intentionally leave train.py's
+        # released single-scale behavior unchanged.
+        self.enable_rgb_loss = True
+        self.enable_language_loss = True
+        self.rgb_loss_coeff = 1.0
+        self.language_loss_coeff = 0.0001
+        self.enable_admm_loss = True
+        self.admm_loss_coeff = 1.0
+        self.admm_start_iter = 100
+        self.admm_end_iter = 9_900
+        self.admm_interval = 50
+        self.simp_iteration1 = 50
+        self.simp_iteration2 = 9_900
+        self.pruning_fraction1 = 0.00001
+        self.pruning_fraction2 = 0.5
+        self.rho_opacity = 0.0005
+        self.rho_sh = 0.0005
+        self.sh_codebook_size = 8000
+        self.freeze_sh_codebook_iter = 9_500
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

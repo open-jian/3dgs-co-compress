@@ -101,13 +101,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
 
-        try:
-            image = Image.open(image_path)
-            # 如果需要，强制转换为 RGB
-            image = image.convert("RGB")
-        except Exception as e:
-            print(f"\nError loading image {image_path}: {e}")
-            continue   
+        image = Image.open(image_path)
+     
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, image_path=image_path, image_name=image_name, width=width, height=height)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
@@ -175,7 +170,6 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
     try:
-        print(f"fetchPly->{ply_path}")
         pcd = fetchPly(ply_path)
     except:
         pcd = None

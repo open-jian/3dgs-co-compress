@@ -21,7 +21,7 @@ import matplotlib
 import torch
 from jaxtyping import Bool, Float
 from torch import Tensor
-import colors
+import eval.common_colors as common_colors
 
 # Colormaps = Literal["default", "turbo", "viridis", "magma", "inferno", "cividis", "gray", "pca"]
 Colormaps = "turbo"
@@ -150,8 +150,8 @@ def apply_depth_colormap(
 
 def apply_boolean_colormap(
     image: Bool[Tensor, "*bs 1"],
-    true_color = colors.WHITE,
-    false_color = colors.BLACK,
+    true_color = common_colors.WHITE,
+    false_color = common_colors.BLACK,
 ):
     """Converts a depth image to color for easier analysis.
 
@@ -180,6 +180,7 @@ def apply_pca_colormap(image: Float[Tensor, "*bs dim"]):
     Returns:
         Tensor: Colored image
     """
+    torch.manual_seed(888)
     original_shape = image.shape
     image = image.view(-1, image.shape[-1])
     _, _, v = torch.pca_lowrank(image)

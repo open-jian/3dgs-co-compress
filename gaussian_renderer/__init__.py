@@ -16,7 +16,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, opt, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, opt, scaling_modifier = 1.0, override_color = None, semantic_level = 0):
     """
     Render the scene. 
     
@@ -48,6 +48,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         prefiltered=False,
         debug=pipe.debug,
         include_feature=opt.include_feature,
+        quick_render=opt.quick_render
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -82,32 +83,36 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             shs = pc.get_features
     else:
         colors_precomp = override_color
+    
+    if opt.quick_render:
+        assert pc._language_feature_weights is not None and pc._language_feature_indices is not None, "None Value Error"
+        language_feature_weights_quick = pc._language_feature_weights
+        # language_feature_indices = torch.from_numpy(pc._language_feature_indices.detach().cpu().numpy()).to(pc._language_feature_weights.device)
+        language_feature_indices = pc._language_feature_indices
+        # print(language_feature_indices)
+        language_feature_weights = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
 
-    if opt.include_feature:
-        language_feature1_precomp = pc.get_language_feature1
-        language_feature2_precomp = pc.get_language_feature2
-        language_feature3_precomp = pc.get_language_feature3
-
-        language_feature1_precomp = language_feature1_precomp/ (language_feature1_precomp.norm(dim=-1, keepdim=True) + 1e-9)
-        language_feature2_precomp = language_feature2_precomp/ (language_feature2_precomp.norm(dim=-1, keepdim=True) + 1e-9)
-        language_feature3_precomp = language_feature3_precomp/ (language_feature3_precomp.norm(dim=-1, keepdim=True) + 1e-9)
-
+    elif opt.include_feature:
+        language_feature_weights = pc.get_render_weights(opt.topk, semantic_level)
+        language_feature_weights_quick = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
+        language_feature_indices = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
+    
     else:
-        language_feature1_precomp = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
-        language_feature2_precomp = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
-        language_feature3_precomp = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
-
+        language_feature_weights = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
+        language_feature_weights_quick = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
+        language_feature_indices = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
+        
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     # start_time = time.time()
 
-    rendered_image, language_feature_image1, language_feature_image2, language_feature_image3, radii = rasterizer(
+    rendered_image, language_feature_weight_map, radii = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
         colors_precomp = colors_precomp,
-        language_feature_precomp = language_feature1_precomp,
-        language_feature2_precomp = language_feature2_precomp,
-        language_feature3_precomp = language_feature3_precomp,
+        language_feature_precomp = language_feature_weights,
+        language_feature_weights_quick = language_feature_weights_quick,
+        language_feature_indices = language_feature_indices,
         opacities = opacity,
         scales = scales,
         rotations = rotations,
@@ -118,10 +123,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # They will be excluded from value updates used in the splitting criteria.
     
     return {"render": rendered_image,
-            "language_feature_image1": language_feature_image1,
-            "language_feature_image2": language_feature_image2,
-            "language_feature_image3": language_feature_image3,
-
+            "language_feature_weight_map": language_feature_weight_map,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii}

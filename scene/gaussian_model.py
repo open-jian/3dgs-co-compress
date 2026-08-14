@@ -20,6 +20,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.vq_utils import get_weights_and_indices, softmax_to_topk_soft_code
 
 class GaussianModel:
 
@@ -50,9 +51,10 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
-        self._language_feature1 = None
-        self._language_feature2 = None
-        self._language_feature3 = None
+        self._language_feature_logits = None
+        self._language_feature_codebooks = None
+        self._language_feature_weights = None
+        self._language_feature_indices = None
         
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -64,10 +66,8 @@ class GaussianModel:
 
     def capture(self, include_feature=False):
         if include_feature:
-            assert self._language_feature1 is not None,  "_language_feature is None"
-            assert self._language_feature2 is not None, "_language_feature2 is None"
-            assert self._language_feature3 is not None, "_language_feature3 is None"
-
+            assert self._language_feature_logits is not None, "language feature logits is None"
+            assert self._language_feature_codebooks is not None, "language feature codebooks is None"
             return (
                 self.active_sh_degree,
                 self._xyz,
@@ -76,9 +76,8 @@ class GaussianModel:
                 self._scaling,
                 self._rotation,
                 self._opacity,
-                self._language_feature1,
-                self._language_feature2,
-                self._language_feature3,
+                self._language_feature_logits,
+                self._language_feature_codebooks,
                 self.max_radii2D,
                 self.xyz_gradient_accum,
                 self.denom,
@@ -102,7 +101,7 @@ class GaussianModel:
             )            
     
     def restore(self, model_args, training_args, mode='train'):
-        if len(model_args) == 15: # 这是一个feature训练时保存的ckpt
+        if len(model_args) == 14: # for language feature
             (self.active_sh_degree, 
             self._xyz, 
             self._features_dc, 
@@ -110,15 +109,14 @@ class GaussianModel:
             self._scaling, 
             self._rotation, 
             self._opacity,
-            self._language_feature1,
-            self._language_feature2,
-            self._language_feature3,
+            self._language_feature_logits,
+            self._language_feature_codebooks,
             self.max_radii2D, 
             xyz_gradient_accum, 
             denom,
             opt_dict, 
             self.spatial_lr_scale) = model_args
-        elif len(model_args) == 12: # 这是一个不训练feature保存的ckpt
+        elif len(model_args) == 12:
             (self.active_sh_degree, 
             self._xyz, 
             self._features_dc, 
@@ -131,7 +129,7 @@ class GaussianModel:
             denom,
             opt_dict, 
             self.spatial_lr_scale) = model_args
-            if not training_args.include_feature: # 如果是以原始gs为初始化来训练feature的话，就不需要restore optimizer
+            if not training_args.include_feature:
                 self.optimizer.load_state_dict(opt_dict)
         
         if mode == 'train':
@@ -163,26 +161,35 @@ class GaussianModel:
         return self.opacity_activation(self._opacity)
     
     @property
-    def get_language_feature1(self):
-        if self._language_feature1 is not None:
-            return self._language_feature1
+    def get_language_feature_logits(self):
+        if self._language_feature_logits is not None:
+            return self._language_feature_logits
         else:
-            raise ValueError('没有设置language feature1')
+            raise ValueError('language feature logits is None')
     
     @property
-    def get_language_feature2(self):
-        if self._language_feature2 is not None:
-            return self._language_feature2
+    def get_language_feature_codebooks(self):
+        if self._language_feature_codebooks is not None:
+            return self._language_feature_codebooks
         else:
-            raise ValueError('没有设置language feature2')
+            raise ValueError('language feature codebooks is None')
 
     @property
-    def get_language_feature3(self):
-        if self._language_feature3 is not None:
-            return self._language_feature3
-        else:
-            raise ValueError('没有设置language feature3')
-            
+    def semantic_level_count(self):
+        """Number of semantic-scale heads stored in this Gaussian model."""
+        if self._language_feature_logits is None:
+            return 0
+        return 1 if self._language_feature_logits.ndim == 2 else self._language_feature_logits.shape[1]
+
+    def _semantic_logits(self):
+        """Return logits as [N, semantic_level, RVQ_layer * codebook]."""
+        logits = self.get_language_feature_logits
+        return logits.unsqueeze(1) if logits.ndim == 2 else logits
+
+    def _semantic_codebooks(self):
+        """Return codebooks as [semantic_level, RVQ_layer, codebook, 512]."""
+        codebooks = self.get_language_feature_codebooks
+        return codebooks.unsqueeze(0) if codebooks.ndim == 3 else codebooks
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -198,6 +205,7 @@ class GaussianModel:
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
+
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
@@ -224,27 +232,78 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         
         if training_args.include_feature:
-            if self._language_feature1 is None or self._language_feature1.shape[0] != self._xyz.shape[0]:
-                # 开始feature训练的时候，往模型中加入language feature参数
-                language_feature = torch.zeros((self._xyz.shape[0], 3), device="cuda")
-                language_feature2 = torch.zeros((self._xyz.shape[0], 3), device="cuda")
-                language_feature3 = torch.zeros((self._xyz.shape[0], 3), device="cuda")
+            semantic_level_num = getattr(training_args, "semantic_level_num", 1)
+            expected_logit_width = training_args.vq_layer_num * training_args.codebook_size
+            semantic_shape_matches = (
+                self._language_feature_logits is not None
+                and self._language_feature_logits.shape[0] == self._xyz.shape[0]
+                and self.semantic_level_count == semantic_level_num
+                and self._semantic_logits().shape[-1] == expected_logit_width
+                and self._semantic_codebooks().shape[1:3]
+                == (training_args.vq_layer_num, training_args.codebook_size)
+            )
+            if not semantic_shape_matches:
+                # initialize language feature logits and codebooks
+                if semantic_level_num == 1:
+                    language_feature_logits = torch.zeros(
+                        (self._xyz.shape[0], expected_logit_width), device="cuda"
+                    )
+                    language_feature_codebooks = torch.randn(
+                        (training_args.vq_layer_num, training_args.codebook_size, 512),
+                        device="cuda",
+                    )
+                else:
+                    language_feature_logits = torch.zeros(
+                        (self._xyz.shape[0], semantic_level_num, expected_logit_width),
+                        device="cuda",
+                    )
+                    language_feature_codebooks = torch.randn(
+                        (
+                            semantic_level_num,
+                            training_args.vq_layer_num,
+                            training_args.codebook_size,
+                            512,
+                        ),
+                        device="cuda",
+                    )
+                self._language_feature_logits = nn.Parameter(language_feature_logits.requires_grad_(True))
+                self._language_feature_codebooks = nn.Parameter(language_feature_codebooks.requires_grad_(True))
 
-                self._language_feature1 = nn.Parameter(language_feature.requires_grad_(True))
-                self._language_feature2 = nn.Parameter(language_feature2.requires_grad_(True))
-                self._language_feature3 = nn.Parameter(language_feature3.requires_grad_(True))
-            l = [
-                {'params': [self._language_feature1], 'lr': training_args.language_feature_lr, "name": "language_feature"}, 
-                {'params': [self._language_feature2], 'lr': training_args.language_feature_lr, "name": "language_feature2"}, 
-                {'params': [self._language_feature3], 'lr': training_args.language_feature_lr, "name": "language_feature3"}, 
-
+            # Keep logits and codebooks in separate groups: logits have one row
+            # per Gaussian and must follow any pruning mask, while codebooks are
+            # global and must never be point-pruned.
+            language_groups = [
+                {'params': [self._language_feature_logits],
+                 'lr': training_args.language_feature_lr, "name": "language_feature_logits"},
+                {'params': [self._language_feature_codebooks],
+                 'lr': training_args.language_feature_lr, "name": "language_feature_codebooks"},
             ]
-            self._xyz.requires_grad_(False)
-            self._features_dc.requires_grad_(False)
-            self._features_rest.requires_grad_(False)
-            self._scaling.requires_grad_(False)
-            self._rotation.requires_grad_(False)
-            self._opacity.requires_grad_(False)
+            if getattr(training_args, "joint_optimize", False):
+                l = [
+                    {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+                    {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
+                    {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+                    {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+                    {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+                    {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+                ] + language_groups
+                for parameter in (
+                    self._xyz,
+                    self._features_dc,
+                    self._features_rest,
+                    self._scaling,
+                    self._rotation,
+                    self._opacity,
+                ):
+                    parameter.requires_grad_(True)
+            else:
+                l = language_groups
+                self._xyz.requires_grad_(False)
+                self._features_dc.requires_grad_(False)
+                self._features_rest.requires_grad_(False)
+                self._scaling.requires_grad_(False)
+                self._rotation.requires_grad_(False)
+                self._opacity.requires_grad_(False)
         else:
             l = [
                 {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -254,7 +313,7 @@ class GaussianModel:
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             ]
-            assert self._language_feature1 is None, "在训练原始gs的时候language feature应该始终为None"
+            assert self._language_feature_logits is None and self._language_feature_codebooks is None
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -278,12 +337,7 @@ class GaussianModel:
         for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
             l.append('f_rest_{}'.format(i))
         l.append('opacity')
-        for i in range(self._language_feature1.shape[1]):
-            l.append(f'language_feature1_{i}')
-        for i in range(self._language_feature2.shape[1]):
-            l.append(f'language_feature2_{i}')
-        for i in range(self._language_feature3.shape[1]):
-            l.append(f'language_feature3_{i}')
+        # l.append('language_feature')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -300,14 +354,11 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
-        language_feature = self._language_feature1.detach().cpu().numpy()
-        language_feature2 = self._language_feature2.detach().cpu().numpy()
-        language_feature3 = self._language_feature3.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, language_feature, language_feature2, language_feature3), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -318,7 +369,6 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
 
     def load_ply(self, path):
-        print("💡 Loading GaussianModel from .ply {}".format(path))
         plydata = PlyData.read(path)
 
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
@@ -331,28 +381,8 @@ class GaussianModel:
         features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
         features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
 
-
-        language_feature1_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("language_feature1")]
-        language_feature1_names = sorted(language_feature1_names, key = lambda x: int(x.split('_')[-1]))
-        language_feature1 = np.zeros((xyz.shape[0], len(language_feature1_names)))
-        for idx, attr_name in enumerate(language_feature1_names):
-            language_feature1[:, idx] = np.asarray(plydata.elements[0][attr_name])
-
-        language_feature2_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("language_feature2")]
-        language_feature2_names = sorted(language_feature2_names, key=lambda x: int(x.split('_')[-1]))
-        language_feature2 = np.zeros((xyz.shape[0], len(language_feature2_names)))
-        for idx, attr_name in enumerate(language_feature2_names):
-            language_feature2[:, idx] = np.asarray(plydata.elements[0][attr_name])
-
-        language_feature3_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("language_feature3")]
-        language_feature3_names = sorted(language_feature3_names, key=lambda x: int(x.split('_')[-1]))
-        language_feature3 = np.zeros((xyz.shape[0], len(language_feature3_names)))
-        for idx, attr_name in enumerate(language_feature3_names):
-            language_feature3[:, idx] = np.asarray(plydata.elements[0][attr_name])
-
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
-        print(f"len(extra_f_names): {len(extra_f_names)}")
         assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
         features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
@@ -379,10 +409,6 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
-
-        self._language_feature1 = nn.Parameter(torch.tensor(language_feature1, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._language_feature2 = nn.Parameter(torch.tensor(language_feature2, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._language_feature3 = nn.Parameter(torch.tensor(language_feature3, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -435,6 +461,56 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+
+    def _prune_named_point_parameter(self, name, parameter, valid_points_mask):
+        """Prune one point-aligned parameter and its Adam state, if optimized."""
+        for group in self.optimizer.param_groups:
+            if group["name"] != name:
+                continue
+            if len(group["params"]) != 1:
+                raise RuntimeError("Optimizer group '{}' must contain one tensor".format(name))
+            old_parameter = group["params"][0]
+            stored_state = self.optimizer.state.pop(old_parameter, None)
+            new_parameter = nn.Parameter(old_parameter[valid_points_mask].requires_grad_(True))
+            group["params"][0] = new_parameter
+            if stored_state is not None:
+                for state_name, state_value in tuple(stored_state.items()):
+                    if (
+                        torch.is_tensor(state_value)
+                        and state_value.ndim > 0
+                        and state_value.shape[0] == valid_points_mask.shape[0]
+                    ):
+                        stored_state[state_name] = state_value[valid_points_mask]
+                self.optimizer.state[new_parameter] = stored_state
+            return new_parameter
+
+        # A frozen point attribute is not present in the optimizer, but it must
+        # still remain aligned with the shared Gaussian mask.
+        return nn.Parameter(
+            parameter[valid_points_mask], requires_grad=parameter.requires_grad
+        )
+
+    def prune_points_admm(self, mask):
+        """Apply one shared mask to geometry and every semantic-scale head."""
+        valid_points_mask = ~mask
+        before = self._xyz.shape[0]
+        self._xyz = self._prune_named_point_parameter("xyz", self._xyz, valid_points_mask)
+        self._features_dc = self._prune_named_point_parameter("f_dc", self._features_dc, valid_points_mask)
+        self._features_rest = self._prune_named_point_parameter("f_rest", self._features_rest, valid_points_mask)
+        self._opacity = self._prune_named_point_parameter("opacity", self._opacity, valid_points_mask)
+        self._scaling = self._prune_named_point_parameter("scaling", self._scaling, valid_points_mask)
+        self._rotation = self._prune_named_point_parameter("rotation", self._rotation, valid_points_mask)
+        if self._language_feature_logits is not None:
+            self._language_feature_logits = self._prune_named_point_parameter(
+                "language_feature_logits",
+                self._language_feature_logits,
+                valid_points_mask,
+            )
+
+        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        self.denom = self.denom[valid_points_mask]
+        self.max_radii2D = self.max_radii2D[valid_points_mask]
+        print("Pruned Gaussians: {} -> {}".format(before, self._xyz.shape[0]))
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -543,3 +619,82 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+    
+    def get_render_weights(self, k, semantic_level=0):
+        logits = self._semantic_logits()[:, semantic_level]
+        _, layer_num, codebook_size, _ = self._semantic_codebooks().shape
+        weights = []
+        for i in range(layer_num):
+            soft_code = softmax_to_topk_soft_code(logits[:, i*codebook_size:(i+1)*codebook_size], k)
+            weights.append(soft_code)
+        return torch.cat(weights, dim=-1).float()
+    
+    def compute_feature_maps(self, language_feature_weight_map, semantic_level=0):
+        D, H, W = language_feature_weight_map.shape
+        language_feature_weight_map = language_feature_weight_map.view(D, -1)
+        language_features = []
+        codebooks = self._semantic_codebooks()[semantic_level]
+        layer_num, codebook_size, _ = codebooks.shape
+        for i in range(layer_num):
+            language_feature = codebooks[i].T @ language_feature_weight_map[i * codebook_size:(i+1)*codebook_size]
+            language_feature = language_feature.view(512, H, W)
+            if i > 0:
+                language_feature += language_features[-1].detach()
+            language_features.append(language_feature)
+        return torch.stack(language_features, dim=1)
+
+    def compute_layer_feature_map(self, language_feature_weight_map, layer_idx, semantic_level=0):
+        D, H, W = language_feature_weight_map.shape
+        language_feature_weight_map = language_feature_weight_map.view(D, -1)
+        codebooks = self._semantic_codebooks()[semantic_level]
+        layer_num, codebook_size, _ = codebooks.shape
+        if layer_idx < 0 or layer_idx >= layer_num:
+            raise ValueError("layer_idx {} is outside [0, {})".format(layer_idx, layer_num))
+        for i in range(layer_idx + 1):
+            language_feature = codebooks[i].T @ language_feature_weight_map[i * codebook_size:(i+1)*codebook_size]
+            language_feature = language_feature.view(512, H, W)
+            if i > 0:
+                language_feature += language_feature_before.detach()
+            language_feature_before = language_feature
+        return language_feature
+    
+    def compute_final_feature_map(self, language_feature_weight_map, semantic_level=0):
+        D, H, W = language_feature_weight_map.shape
+        language_feature_weight_map = language_feature_weight_map.view(D, -1) 
+        codebooks = self._semantic_codebooks()[semantic_level]
+        language_feature = codebooks.reshape(-1, 512).T @ language_feature_weight_map
+        language_feature = language_feature.view(512, H, W)
+        return language_feature
+
+    def prepare_multiscale_quick_render(self, topk=4):
+        """Build the released 3-scale sparse quick-render representation."""
+        logits = self._semantic_logits()
+        codebooks = self._semantic_codebooks()
+        semantic_levels, rvq_layers, codebook_size, feature_dim = codebooks.shape
+        if semantic_levels != 3 or rvq_layers != 1:
+            raise ValueError(
+                "Quick rendering requires 3 semantic heads with one RVQ layer; "
+                "got {} heads and {} layers".format(semantic_levels, rvq_layers)
+            )
+        if codebook_size != 64 or feature_dim != 512:
+            raise ValueError(
+                "The released quick rasterizer requires [3, 64, 512] codebooks"
+            )
+        weights, indices = [], []
+        for semantic_level in range(semantic_levels):
+            level_weights, level_indices = get_weights_and_indices(
+                logits[:, semantic_level], topk
+            )
+            weights.append(level_weights)
+            indices.append(level_indices + semantic_level * codebook_size)
+        self._language_feature_weights = torch.cat(weights, dim=1)
+        self._language_feature_indices = torch.cat(indices, dim=1)
+
+    def get_quick_codebooks(self):
+        """Return quick-render codebooks as [3, 64, 512]."""
+        codebooks = self.get_language_feature_codebooks
+        if codebooks.ndim == 4:
+            if codebooks.shape[1] != 1:
+                raise ValueError("Quick rendering only supports one RVQ layer")
+            return codebooks[:, 0]
+        return codebooks

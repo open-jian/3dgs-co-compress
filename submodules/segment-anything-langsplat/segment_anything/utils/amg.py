@@ -115,7 +115,14 @@ def mask_to_rle_pytorch(tensor: torch.Tensor) -> List[Dict[str, Any]]:
 
     # Compute change indices
     diff = tensor[:, 1:] ^ tensor[:, :-1]
-    change_indices = diff.nonzero()
+    # PyTorch 1.12 occasionally trips an internal CPU nonzero assertion for
+    # large masks (TensorAdvancedIndexing.cpp:2038).  NumPy returns the same
+    # row-major change coordinates and avoids that old runtime bug.  Keep the
+    # CUDA path unchanged.
+    if diff.device.type == "cpu":
+        change_indices = torch.from_numpy(np.stack(np.nonzero(diff.numpy()), axis=1))
+    else:
+        change_indices = diff.nonzero()
 
     # Encode run length
     out = []

@@ -1,0 +1,1 @@
+python preprocess.py --dataset_path ../../data/lerf_ovs/teatime
