@@ -265,7 +265,80 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+
+def readScanNetInfo(path, white_background, eval, llffhold=8, extensions=(".png", ".jpg")):
+    """Read native ScanNet color images, camera-to-world poses, and intrinsics."""
+    path = Path(path)
+    image_by_stem = {
+        item.stem: item
+        for item in (path / "color").iterdir()
+        if item.is_file() and item.suffix.lower() in extensions
+    }
+    pose_by_stem = {
+        item.stem: item
+        for item in (path / "pose").iterdir()
+        if item.is_file() and item.suffix.lower() == ".txt"
+    }
+    stems = sorted(image_by_stem.keys() & pose_by_stem.keys(), key=lambda stem: int(stem))
+    if not stems:
+        raise RuntimeError(f"No matching ScanNet color/pose frames found under {path}")
+
+    K = np.loadtxt(path / "intrinsic" / "intrinsic_color.txt")
+    first_image = Image.open(image_by_stem[stems[0]])
+    width, height = first_image.size
+    fovx = focal2fov(K[0, 0], width)
+    fovy = focal2fov(K[1, 1], height)
+    cam_infos = []
+    for stem in stems:
+        c2w = np.asarray(np.loadtxt(pose_by_stem[stem]), dtype=np.float32).reshape(4, 4)
+        if not np.isfinite(c2w).all():
+            continue
+        try:
+            w2c = np.linalg.inv(c2w)
+        except np.linalg.LinAlgError:
+            continue
+        image_path = image_by_stem[stem]
+        cam_infos.append(
+            CameraInfo(
+                uid=int(stem),
+                R=w2c[:3, :3].T,
+                T=w2c[:3, 3],
+                FovY=fovy,
+                FovX=fovx,
+                image=Image.open(image_path),
+                image_path=str(image_path),
+                image_name=stem,
+                width=width,
+                height=height,
+            )
+        )
+
+    ply_path = str(path / "points3d.ply")
+    plydata = PlyData.read(ply_path)
+    vertices = plydata["vertex"]
+    positions = np.column_stack([vertices[name] for name in ("x", "y", "z")])
+    colors = np.column_stack([vertices[name] for name in ("red", "green", "blue")]) / 255.0
+    if {"nx", "ny", "nz"}.issubset(vertices.data.dtype.names):
+        normals = np.column_stack([vertices[name] for name in ("nx", "ny", "nz")])
+    else:
+        normals = np.zeros_like(positions)
+    pcd = BasicPointCloud(points=positions, colors=colors, normals=normals)
+
+    if eval:
+        train_cam_infos = [cam for index, cam in enumerate(cam_infos) if index % llffhold != 0]
+        test_cam_infos = [cam for index, cam in enumerate(cam_infos) if index % llffhold == 0]
+    else:
+        train_cam_infos, test_cam_infos = cam_infos, []
+    return SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cam_infos,
+        test_cameras=test_cam_infos,
+        nerf_normalization=getNerfppNorm(cam_infos),
+        ply_path=ply_path,
+    )
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "ScanNet": readScanNetInfo,
 }

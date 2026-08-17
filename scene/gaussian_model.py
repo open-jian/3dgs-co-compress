@@ -55,6 +55,11 @@ class GaussianModel:
         self._language_feature_codebooks = None
         self._language_feature_weights = None
         self._language_feature_indices = None
+        # Optional evaluation-only lineage.  It is deliberately excluded from
+        # capture() and deployment artifacts; train_joint writes a separately
+        # hashed sidecar for controlled source-ID runs.
+        self._source_ids = None
+        self._source_id_origin_count = None
         
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -149,6 +154,34 @@ class GaussianModel:
     @property
     def get_xyz(self):
         return self._xyz
+
+    def enable_source_id_tracking(self, source_ids=None, origin_point_count=None):
+        """Attach a strictly ordered source-row ID to every current Gaussian."""
+        point_count = int(self._xyz.shape[0])
+        if source_ids is None:
+            source_ids = torch.arange(
+                point_count, dtype=torch.int64, device=self._xyz.device
+            )
+        else:
+            source_ids = source_ids.detach().to(
+                device=self._xyz.device, dtype=torch.int64
+            ).contiguous()
+        if source_ids.ndim != 1 or source_ids.shape[0] != point_count:
+            raise ValueError("source IDs must have one row per Gaussian")
+        if origin_point_count is None:
+            origin_point_count = point_count
+        origin_point_count = int(origin_point_count)
+        if source_ids.numel():
+            if int(source_ids.min()) < 0 or int(source_ids.max()) >= origin_point_count:
+                raise ValueError("source IDs are outside the origin row range")
+            if source_ids.numel() > 1 and not bool(
+                torch.all(source_ids[1:] > source_ids[:-1])
+            ):
+                raise ValueError(
+                    "source IDs must be strictly increasing; rows were reordered or duplicated"
+                )
+        self._source_ids = source_ids
+        self._source_id_origin_count = origin_point_count
     
     @property
     def get_features(self):
@@ -278,32 +311,40 @@ class GaussianModel:
                 {'params': [self._language_feature_codebooks],
                  'lr': training_args.language_feature_lr, "name": "language_feature_codebooks"},
             ]
-            if getattr(training_args, "joint_optimize", False):
-                l = [
-                    {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-                    {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-                    {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
-                    {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-                    {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-                    {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-                ] + language_groups
-                for parameter in (
-                    self._xyz,
-                    self._features_dc,
-                    self._features_rest,
-                    self._scaling,
-                    self._rotation,
-                    self._opacity,
-                ):
+            support_groups = [
+                {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+                {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
+                {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+            ]
+            support_parameters = (
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+            )
+            if getattr(training_args, "support_only", False):
+                l = support_groups
+                for parameter in support_parameters:
                     parameter.requires_grad_(True)
+                self._language_feature_logits.requires_grad_(False)
+                self._language_feature_codebooks.requires_grad_(False)
+            elif getattr(training_args, "joint_optimize", False):
+                l = support_groups + language_groups
+                for parameter in support_parameters:
+                    parameter.requires_grad_(True)
+                self._language_feature_logits.requires_grad_(True)
+                self._language_feature_codebooks.requires_grad_(True)
             else:
                 l = language_groups
-                self._xyz.requires_grad_(False)
-                self._features_dc.requires_grad_(False)
-                self._features_rest.requires_grad_(False)
-                self._scaling.requires_grad_(False)
-                self._rotation.requires_grad_(False)
-                self._opacity.requires_grad_(False)
+                for parameter in support_parameters:
+                    parameter.requires_grad_(False)
+                self._language_feature_logits.requires_grad_(True)
+                self._language_feature_codebooks.requires_grad_(True)
         else:
             l = [
                 {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -447,6 +488,12 @@ class GaussianModel:
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
+        if self._source_ids is not None:
+            if valid_points_mask.shape[0] != self._source_ids.shape[0]:
+                raise ValueError("pruning mask and source-ID rows disagree")
+            next_source_ids = self._source_ids[valid_points_mask].contiguous()
+        else:
+            next_source_ids = None
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
@@ -461,6 +508,8 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if next_source_ids is not None:
+            self._source_ids = next_source_ids
 
     def _prune_named_point_parameter(self, name, parameter, valid_points_mask):
         """Prune one point-aligned parameter and its Adam state, if optimized."""
@@ -494,6 +543,12 @@ class GaussianModel:
         """Apply one shared mask to geometry and every semantic-scale head."""
         valid_points_mask = ~mask
         before = self._xyz.shape[0]
+        if self._source_ids is not None:
+            if valid_points_mask.shape[0] != self._source_ids.shape[0]:
+                raise ValueError("ADMM pruning mask and source-ID rows disagree")
+            next_source_ids = self._source_ids[valid_points_mask].contiguous()
+        else:
+            next_source_ids = None
         self._xyz = self._prune_named_point_parameter("xyz", self._xyz, valid_points_mask)
         self._features_dc = self._prune_named_point_parameter("f_dc", self._features_dc, valid_points_mask)
         self._features_rest = self._prune_named_point_parameter("f_rest", self._features_rest, valid_points_mask)
@@ -510,6 +565,8 @@ class GaussianModel:
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if next_source_ids is not None:
+            self._source_ids = next_source_ids
         print("Pruned Gaussians: {} -> {}".format(before, self._xyz.shape[0]))
 
     def cat_tensors_to_optimizer(self, tensors_dict):
@@ -535,6 +592,11 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+        if self._source_ids is not None and new_xyz.shape[0] > 0:
+            raise RuntimeError(
+                "Source-ID controlled runs prohibit densification because a new "
+                "Gaussian has no unique RGB-host source row."
+            )
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,

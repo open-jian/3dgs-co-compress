@@ -40,6 +40,44 @@ from utils.vq_utils import get_weights_and_indices
 import torch.nn.functional as F
 
 
+def save_lerf_metrics(args, chosen_iou_all, chosen_lvl_list, acc_num,
+                      total_queries, timing=None):
+    """Persist the exact values used by the LERF tables.
+
+    The original evaluator only printed rounded metrics to a timestamped log,
+    which makes aggregation error-prone.  Keep the log output for backwards
+    compatibility and additionally write one machine-readable file per scene.
+    """
+    metrics = {
+        "dataset": args.dataset_name,
+        "checkpoint": (
+            args.semantic_sidecar or args.compact_artifact
+            or args.joint_checkpoint or args.checkpoint
+        ),
+        "mask_threshold": float(args.mask_thresh),
+        "topk": int(args.topk),
+        "rendered_miou": float(sum(chosen_iou_all) / len(chosen_iou_all)),
+        "localization_correct": int(acc_num),
+        "localization_total": int(total_queries),
+        "localization_accuracy": float(acc_num / total_queries),
+        "per_query_iou": [float(value) for value in chosen_iou_all],
+        "chosen_semantic_level": [int(value) for value in chosen_lvl_list],
+    }
+    if args.semantic_sidecar:
+        metrics["semantic_sidecar"] = os.path.abspath(args.semantic_sidecar)
+        metrics["decoded_geometry_ply"] = os.path.abspath(args.geometry_ply)
+        metrics["deployment_geometry_source"] = (
+            "transient FCGS decode output; dense RGB checkpoint not loaded"
+        )
+    if timing is not None:
+        metrics["timing"] = timing
+    metrics_path = os.path.join(args.output_path, "metrics_lerf.json")
+    with open(metrics_path, "w") as metrics_file:
+        json.dump(metrics, metrics_file, indent=2, sort_keys=True)
+    logger.info("metrics json: %s", metrics_path)
+    return metrics
+
+
 def get_logger(name, log_file=None, log_level=logging.INFO, file_mode='w'):
     logger = logging.getLogger(name)
     stream_handler = logging.StreamHandler()
@@ -108,7 +146,8 @@ def smooth_cuda(mask_pred:torch.Tensor):
     mask = (avg_filtered > 0.5).type(torch.uint8).squeeze(0).squeeze(0)
     return mask
 
-def segmentation_process_cuda(sem_map:torch.tensor, clip_model, thresh, img_ann, prompts):
+def segmentation_process_cuda(sem_map:torch.tensor, clip_model, thresh, img_ann,
+                              prompts, visual_dir=None, rgb_img=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     valid_map = clip_model.get_max_across_quick(sem_map)
     n_head, n_prompt, h, w = valid_map.shape
@@ -119,6 +158,7 @@ def segmentation_process_cuda(sem_map:torch.tensor, clip_model, thresh, img_ann,
     for k in range(n_prompt):
         iou_lvl = torch.zeros(n_head).to(device)
         mask_lvl = torch.zeros((n_head, h, w)).to(device)
+        normalized_lvl = torch.zeros((n_head, h, w)).to(device)
         for i in range(n_head):
             scale = 29
             avg_pool = torch.nn.AvgPool2d(kernel_size=scale, stride=1, padding=14, count_include_pad=False).to(device)
@@ -131,6 +171,7 @@ def segmentation_process_cuda(sem_map:torch.tensor, clip_model, thresh, img_ann,
             output = output / (torch.max(output) + 1e-9)
             output = output * (1.0 - (-1.0)) + (-1.0)
             output = torch.clip(output, 0, 1)
+            normalized_lvl[i] = output
 
             mask_pred = (output > thresh).type(torch.uint8)
             mask_pred = smooth_cuda(mask_pred)
@@ -152,6 +193,29 @@ def segmentation_process_cuda(sem_map:torch.tensor, clip_model, thresh, img_ann,
         
         chosen_iou_list.append(iou_lvl[chosen_lvl].cpu().numpy().item())
         chosen_lvl_list.append(chosen_lvl.cpu().numpy().item())
+
+        if visual_dir is not None:
+            visual_dir = Path(visual_dir)
+            visual_dir.mkdir(exist_ok=True, parents=True)
+            safe_prompt = "".join(
+                character if character.isalnum() or character in "-_" else "_"
+                for character in prompts[k]
+            )
+            level = int(chosen_lvl.item())
+            heat = (255.0 * normalized_lvl[level].detach().cpu().numpy()).astype(np.uint8)
+            heat_bgr = cv2.applyColorMap(heat, cv2.COLORMAP_TURBO)
+            cv2.imwrite(str(visual_dir / f"{safe_prompt}_heatmap.png"), heat_bgr)
+            mask = (255 * mask_lvl[level].detach().cpu().numpy()).astype(np.uint8)
+            cv2.imwrite(str(visual_dir / f"{safe_prompt}_mask.png"), mask)
+            if rgb_img is not None:
+                rgb = rgb_img.detach().cpu().numpy()
+                rgb_u8 = np.clip(255.0 * rgb, 0, 255).astype(np.uint8)
+                heat_rgb = heat_bgr[..., ::-1]
+                overlay = np.clip(0.55 * rgb_u8 + 0.45 * heat_rgb, 0, 255).astype(np.uint8)
+                cv2.imwrite(
+                    str(visual_dir / f"{safe_prompt}_overlay.png"),
+                    overlay[..., ::-1],
+                )
 
     return chosen_iou_list, chosen_lvl_list
 
@@ -269,7 +333,12 @@ def evaluate(dataset:ModelParams, pipeline:PipelineParams, args):
         img_ann = gt_ann[f'{idx}']
         clip_model.set_positives(list(img_ann.keys()))
         
-        c_iou_list, c_lvl = segmentation_process_cuda(restored_feat, clip_model, args.mask_thresh, img_ann, list(img_ann.keys()))
+        c_iou_list, c_lvl = segmentation_process_cuda(
+            restored_feat, clip_model, args.mask_thresh, img_ann,
+            list(img_ann.keys()),
+            image_name / "predictions" if args.save_visuals else None,
+            rgb_img,
+        )
         chosen_iou_all.extend(c_iou_list)
         chosen_lvl_list.extend(c_lvl)
         acc_num_img = localization_process_cuda(restored_feat, clip_model, img_ann)
@@ -306,6 +375,67 @@ def evaluate_quick(dataset:ModelParams, pipeline:PipelineParams, args):
     chosen_iou_all, chosen_lvl_list = [], []
     acc_num = 0
 
+    load_start = time.perf_counter()
+    combined_gaussians = GaussianModel(dataset.sh_degree)
+    dataset.model_path = (
+        os.path.dirname(os.path.abspath(args.semantic_sidecar))
+        if args.semantic_sidecar else (
+            os.path.dirname(os.path.abspath(args.compact_artifact))
+            if args.compact_artifact else (
+                os.path.dirname(os.path.abspath(args.joint_checkpoint))
+                if args.joint_checkpoint else args.ckpt_paths[0]
+            )
+        )
+    )
+    scene = Scene(dataset, combined_gaussians, shuffle=False)
+    views = scene.getTrainCameras()
+    if args.semantic_sidecar:
+        from semantic_sidecar import load_sidecar_into_gaussians
+        # The PLY must be the transient output of decoding the counted FCGS
+        # bitstream with its declared shared checkpoint.  Do not load the
+        # dense RGB training/import checkpoint during deployment evaluation.
+        combined_gaussians.load_ply(args.geometry_ply)
+        combined_gaussians, _sidecar_bundle = load_sidecar_into_gaussians(
+            combined_gaussians, args.semantic_sidecar, device="cuda"
+        )
+    elif args.compact_artifact:
+        from compact_artifact import load_compact_gaussians
+        combined_gaussians, _compact_bundle = load_compact_gaussians(
+            args.compact_artifact, device="cuda"
+        )
+    else:
+        checkpoint = (
+            args.joint_checkpoint
+            if args.joint_checkpoint
+            else os.path.join(args.ckpt_paths[0], f'chkpnt{args.checkpoint}.pth')
+        )
+        (model_params, first_iter) = torch.load(checkpoint)
+        combined_gaussians.restore(model_params, args, mode='test')
+    if args.joint_checkpoint:
+        combined_gaussians.prepare_multiscale_quick_render(topk=args.topk)
+    elif not args.compact_artifact and not args.semantic_sidecar:
+        language_feature_weights = []
+        language_feature_indices = []
+        language_feature_codebooks = []
+        for level_idx in range(3):
+            gaussians = GaussianModel(dataset.sh_degree)
+            checkpoint = os.path.join(args.ckpt_paths[level_idx], f'chkpnt{args.checkpoint}.pth')
+            (model_params, first_iter) = torch.load(checkpoint)
+            gaussians.restore(model_params, args, mode='test')
+            language_feature_codebooks.append(gaussians._language_feature_codebooks.view(-1, 512))
+            weights, indices = get_weights_and_indices(gaussians._language_feature_logits, args.topk)
+            language_feature_weights.append(weights)
+            language_feature_indices.append(indices + int(level_idx * gaussians._language_feature_codebooks.shape[1]))
+        combined_gaussians._language_feature_codebooks = torch.stack(language_feature_codebooks, dim=0)
+        combined_gaussians._language_feature_weights = torch.cat(language_feature_weights, dim=1)
+        combined_gaussians._language_feature_indices = torch.cat(language_feature_indices, dim=1)
+    bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    torch.cuda.synchronize()
+    representation_load_seconds = time.perf_counter() - load_start
+    render_seconds = []
+    query_seconds = []
+
     for i, idx in enumerate(tqdm(eval_index_list)):
         rgb_img = cv2.imread(image_paths[i])[..., ::-1]
         rgb_img = (rgb_img / 255.0).astype(np.float32)
@@ -314,50 +444,29 @@ def evaluate_quick(dataset:ModelParams, pipeline:PipelineParams, args):
         image_name = Path(args.output_path) / f'{idx+1:0>5}'
         image_name.mkdir(exist_ok=True, parents=True)
 
-        combined_gaussians = GaussianModel(dataset.sh_degree)
-        dataset.model_path = (
-            os.path.dirname(os.path.abspath(args.joint_checkpoint))
-            if args.joint_checkpoint else args.ckpt_paths[0]
-        )
-        scene = Scene(dataset, combined_gaussians, shuffle=False)
-        views = scene.getTrainCameras()
         view = views[idx]
-        checkpoint = (
-            args.joint_checkpoint
-            if args.joint_checkpoint
-            else os.path.join(args.ckpt_paths[0], f'chkpnt{args.checkpoint}.pth')
-        )
-        (model_params, first_iter) = torch.load(checkpoint)
-        combined_gaussians.restore(model_params, args, mode='test')
         img_ann = gt_ann[f'{idx}']
+        query_start = time.perf_counter()
         clip_model.set_positives(list(img_ann.keys()))
-        bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
-        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-        if args.joint_checkpoint:
-            combined_gaussians.prepare_multiscale_quick_render(topk=4)
-        else:
-            language_feature_weights = []
-            language_feature_indices = []
-            language_feature_codebooks = []
-            for level_idx in range(3):
-                gaussians = GaussianModel(dataset.sh_degree)
-                checkpoint = os.path.join(args.ckpt_paths[level_idx], f'chkpnt{args.checkpoint}.pth')
-                (model_params, first_iter) = torch.load(checkpoint)
-                gaussians.restore(model_params, args, mode='test')
-                language_feature_codebooks.append(gaussians._language_feature_codebooks.view(-1, 512))
-                weights, indices = get_weights_and_indices(gaussians._language_feature_logits, 4)
-                language_feature_weights.append(weights)
-                language_feature_indices.append(indices + int(level_idx * gaussians._language_feature_codebooks.shape[1]))
-            combined_gaussians._language_feature_codebooks = torch.stack(language_feature_codebooks, dim=0)
-            combined_gaussians._language_feature_weights = torch.cat(language_feature_weights, dim=1)
-            combined_gaussians._language_feature_indices = torch.cat(language_feature_indices, dim=1)
-        
+        torch.cuda.synchronize()
+        query_embedding_seconds = time.perf_counter() - query_start
+        render_start = time.perf_counter()
         language_feature_image = render_language_feature_map_quick(combined_gaussians, view, pipeline, background, args)
+        torch.cuda.synchronize()
+        render_seconds.append(time.perf_counter() - render_start)
         restored_feat = language_feature_image.permute(0, 2, 3, 1)
-        c_iou_list, c_lvl = segmentation_process_cuda(restored_feat, clip_model, args.mask_thresh, img_ann, list(img_ann.keys()))
+        query_start = time.perf_counter()
+        c_iou_list, c_lvl = segmentation_process_cuda(
+            restored_feat, clip_model, args.mask_thresh, img_ann,
+            list(img_ann.keys()),
+            image_name / "predictions" if args.save_visuals else None,
+            rgb_img,
+        )
         chosen_iou_all.extend(c_iou_list)
         chosen_lvl_list.extend(c_lvl)
         acc_num_img = localization_process_cuda(restored_feat, clip_model, img_ann)
+        torch.cuda.synchronize()
+        query_seconds.append(query_embedding_seconds + time.perf_counter() - query_start)
         acc_num += acc_num_img
 
     logger.info(f'checkpoint: {args.checkpoint}')
@@ -372,6 +481,17 @@ def evaluate_quick(dataset:ModelParams, pipeline:PipelineParams, args):
         total_bboxes += len(list(img_ann.keys()))
     acc = acc_num / total_bboxes
     logger.info("Localization accuracy: " + f'{acc:.4f}')
+
+    timing = {
+        "representation_load_seconds": float(representation_load_seconds),
+        "semantic_render_ms_per_view": float(1000.0 * sum(render_seconds) / len(render_seconds)),
+        "query_batch_ms_per_view": float(1000.0 * sum(query_seconds) / len(query_seconds)),
+        "query_ms_per_prompt": float(1000.0 * sum(query_seconds) / total_bboxes),
+        "annotated_views": int(len(eval_index_list)),
+    }
+    save_lerf_metrics(
+        args, chosen_iou_all, chosen_lvl_list, acc_num, total_bboxes, timing
+    )
 
     return
 
@@ -398,6 +518,9 @@ if __name__ == "__main__":
     # arguments for gaussian model
     parser.add_argument("--ckpt_root_path", default='output', type=str)
     parser.add_argument("--joint_checkpoint", default=None, type=str)
+    parser.add_argument("--compact_artifact", default=None, type=str)
+    parser.add_argument("--geometry_ply", default=None, type=str)
+    parser.add_argument("--semantic_sidecar", default=None, type=str)
     parser.add_argument("--include_feature", action="store_true")
     parser.add_argument("--quick_render", action="store_true")
     parser.add_argument("--quiet", action="store_true")
@@ -411,11 +534,35 @@ if __name__ == "__main__":
     parser.add_argument("--mask_thresh", type=float, default=0.4)
     parser.add_argument("--checkpoint", type=int, default=10000)
     parser.add_argument("--topk", type=int, default=1)
+    parser.add_argument("--save_visuals", action="store_true")
     #------------------------------------------------------------
 
     args = get_combined_args(parser)
-    if args.joint_checkpoint and not args.quick_render:
-        raise ValueError("--joint_checkpoint currently requires --quick_render")
+    # ``get_combined_args`` drops command-line options whose value is None
+    # when they are absent from an older cfg_args file.  Deployment selectors
+    # are intentionally optional, so restore their explicit defaults here.
+    for optional_name in (
+        "joint_checkpoint", "compact_artifact", "geometry_ply",
+        "semantic_sidecar",
+    ):
+        if not hasattr(args, optional_name):
+            setattr(args, optional_name, None)
+    if bool(args.geometry_ply) != bool(args.semantic_sidecar):
+        raise ValueError(
+            "--geometry_ply and --semantic_sidecar must be provided together"
+        )
+    deployment_inputs = sum(bool(value) for value in (
+        args.joint_checkpoint, args.compact_artifact, args.semantic_sidecar
+    ))
+    if deployment_inputs > 1:
+        raise ValueError(
+            "choose one of joint checkpoint, compact artifact, or FCGS semantic sidecar"
+        )
+    if deployment_inputs and not args.quick_render:
+        raise ValueError("joint/compact/sidecar evaluation requires --quick_render")
+    if args.semantic_sidecar:
+        # Skip the legacy RGB optimizer reload and enable semantic rendering.
+        args.include_feature = True
     args.ckpt_paths = [os.path.join(args.ckpt_root_path, args.dataset_name + f"_{args.index}_{level}") for level in [1, 2, 3]]
     args.output_path = os.path.join(args.output_dir, args.dataset_name + f"_{args.index}")
     args.json_folder = os.path.join(args.json_folder, args.dataset_name)

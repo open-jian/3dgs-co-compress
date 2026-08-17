@@ -45,6 +45,11 @@ class Scene:
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+        elif "scannet" in args.source_path.lower():
+            print("Found ScanNet source directory, using native color/pose/intrinsics loader")
+            scene_info = sceneLoadTypeCallbacks["ScanNet"](
+                args.source_path, args.white_background, args.eval
+            )
         else:
             print(args.source_path)
             assert False, "Could not recognize scene type!"

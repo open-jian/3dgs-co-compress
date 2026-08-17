@@ -2,9 +2,12 @@
 
 This entry point keeps one Gaussian geometry and three semantic VQ heads.  The
 three heads are supervised together, then every pruning event applies one mask
-to geometry, RGB attributes, opacity, and all semantic logits.
+to geometry, RGB attributes, opacity, and all semantic logits.  The optional
+semantic-support stop-gradient ablation keeps the semantic logits/codebooks
+trainable while detaching the shared support only on semantic render passes.
 """
 
+import inspect
 import os
 import sys
 import uuid
@@ -18,6 +21,7 @@ from admm import ADMM, get_pruning_mask
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_renderer import network_gui, render
 from scene import GaussianModel, Scene
+from source_id_lineage import initialize_lineage, save_lineage_sidecar
 from utils.general_utils import safe_state
 from utils.loss_utils import cos_loss, l1_loss, ssim
 from utils.vq_utils import (
@@ -115,7 +119,12 @@ def training(
         raise ValueError("topk must be in [1, codebook_size]")
 
     opt.semantic_level_num = len(feature_levels)
-    opt.joint_optimize = not args.semantic_only
+    opt.joint_optimize = not args.semantic_only and not args.support_only
+    opt.support_only = args.support_only
+    # ``topk`` is a joint-training CLI option rather than an
+    # OptimizationParams field, but the renderer consumes the extracted
+    # optimization namespace.
+    opt.topk = args.topk
     if args.semantic_only:
         args.no_rgb_loss = True
         args.no_admm_loss = True
@@ -129,8 +138,16 @@ def training(
 
     first_iter = 0
     checkpoint_has_semantics = False
+    source_id_metadata = None
     if checkpoint:
-        model_params, first_iter = torch.load(checkpoint)
+        # Training checkpoints include NumPy/Python RNG state so that a resumed
+        # run can reproduce the sampler stream.  PyTorch >=2.6 defaults to the
+        # tensor-only unpickler, which rejects that trusted, locally generated
+        # state.  Make the established checkpoint contract explicit.
+        load_kwargs = {}
+        if "weights_only" in inspect.signature(torch.load).parameters:
+            load_kwargs["weights_only"] = False
+        model_params, first_iter = torch.load(checkpoint, **load_kwargs)
         checkpoint_has_semantics = len(model_params) == 14
         if len(model_params) == 12:
             first_iter = 0
@@ -153,6 +170,22 @@ def training(
             first_iter = 0
     elif opt.include_feature:
         raise ValueError("--start_checkpoint must point to an RGB or joint checkpoint")
+
+    if args.track_source_ids:
+        if not checkpoint:
+            raise ValueError("--track_source_ids requires --start_checkpoint")
+        source_id_metadata = initialize_lineage(
+            gaussians,
+            checkpoint,
+            origin_checkpoint=args.source_id_origin_checkpoint,
+            input_sidecar=args.source_id_input,
+        )
+        print(
+            "Source-ID tracking enabled: {} current rows from {} origin rows".format(
+                gaussians.get_xyz.shape[0],
+                source_id_metadata["origin_point_count"],
+            )
+        )
 
     if opt.include_feature and not checkpoint_has_semantics:
         initialize_scale_codebooks(gaussians, dataset, opt, feature_levels)
@@ -220,35 +253,62 @@ def training(
         if iteration - 1 == debug_from:
             pipe.debug = True
 
-        targets = viewpoint.get_language_features(dataset.lf_path, feature_levels)
+        language_enabled = opt.enable_language_loss and not args.no_language_loss
         semantic_losses = []
         rgb_image = None
-        for semantic_level, (target, mask) in enumerate(targets):
-            render_package = render(
+
+        # With a semantic-to-support gradient stop, RGB needs its own normal
+        # render so L_rgb can still update the support.  If language supervision
+        # is disabled (the first stage of the sequential baseline), this single
+        # render also avoids three unnecessary semantic rasterizations.
+        if args.stop_semantic_support_grad or not language_enabled:
+            rgb_image = render(
                 viewpoint,
                 gaussians,
                 pipe,
                 background,
                 opt,
-                semantic_level=semantic_level,
-            )
-            if rgb_image is None:
-                rgb_image = render_package["render"]
-            weight_map = render_package["language_feature_weight_map"]
-            rvq_layers = gaussians._semantic_codebooks().shape[1]
-            rvq_layer = min(iteration * rvq_layers // opt.iterations, rvq_layers - 1)
-            prediction = gaussians.compute_layer_feature_map(
-                weight_map, rvq_layer, semantic_level=semantic_level
-            )
-            if args.normalize:
-                prediction = prediction / (prediction.norm(dim=0, keepdim=True) + 1e-10)
-            semantic_losses.append(
-                semantic_reconstruction_loss(
-                    prediction, target, mask, args.semantic_loss
-                )
-            )
+                semantic_level=0,
+                detach_semantics=True,
+            )["render"]
 
-        language_loss = torch.stack(semantic_losses).sum()
+        if language_enabled:
+            targets = viewpoint.get_language_features(dataset.lf_path, feature_levels)
+            for semantic_level, (target, mask) in enumerate(targets):
+                render_package = render(
+                    viewpoint,
+                    gaussians,
+                    pipe,
+                    background,
+                    opt,
+                    semantic_level=semantic_level,
+                    detach_support=args.stop_semantic_support_grad,
+                )
+                if rgb_image is None:
+                    rgb_image = render_package["render"]
+                weight_map = render_package["language_feature_weight_map"]
+                rvq_layers = gaussians._semantic_codebooks().shape[1]
+                rvq_layer = min(
+                    iteration * rvq_layers // opt.iterations, rvq_layers - 1
+                )
+                prediction = gaussians.compute_layer_feature_map(
+                    weight_map, rvq_layer, semantic_level=semantic_level
+                )
+                if args.normalize:
+                    prediction = prediction / (
+                        prediction.norm(dim=0, keepdim=True) + 1e-10
+                    )
+                semantic_losses.append(
+                    semantic_reconstruction_loss(
+                        prediction, target, mask, args.semantic_loss
+                    )
+                )
+            language_loss = torch.stack(semantic_losses).sum()
+        else:
+            language_loss = rgb_image.new_zeros(())
+            semantic_losses = [
+                rgb_image.new_zeros(()) for _ in feature_levels
+            ]
         target_rgb = viewpoint.original_image.cuda()
         rgb_l1 = l1_loss(rgb_image, target_rgb)
         rgb_loss = (
@@ -346,11 +406,20 @@ def training(
                 scene.save(iteration)
             if iteration in checkpoint_iterations:
                 print("\n[ITER {}] Saving joint checkpoint".format(iteration))
+                checkpoint_path = os.path.join(
+                    scene.model_path, "chkpnt{}.pth".format(iteration)
+                )
                 torch.save(
                     (gaussians.capture(opt.include_feature), iteration),
-                    os.path.join(scene.model_path, "chkpnt{}.pth".format(iteration)),
+                    checkpoint_path,
                 )
                 save_sh_quantization(admm, scene.model_path, iteration)
+                if args.track_source_ids:
+                    save_lineage_sidecar(
+                        gaussians,
+                        checkpoint_path,
+                        source_id_metadata,
+                    )
 
     progress_bar.close()
     if tb_writer:
@@ -369,8 +438,41 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[10_000])
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[10_000])
     parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--track_source_ids",
+        action="store_true",
+        default=False,
+        help=(
+            "track final/checkpoint rows back to the RGB-host row IDs and write "
+            "an evaluation-only sidecar beside every saved checkpoint"
+        ),
+    )
+    parser.add_argument(
+        "--source_id_input",
+        type=str,
+        default=None,
+        help="lineage sidecar bound to a semantic/joint --start_checkpoint",
+    )
+    parser.add_argument(
+        "--source_id_origin_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "original RGB checkpoint whose ordered rows define source IDs; for a "
+            "fresh RGB start it must exactly match the converted host geometry"
+        ),
+    )
     parser.add_argument("--feature_levels", nargs=3, type=int, default=[1, 2, 3])
     parser.add_argument("--semantic_only", action="store_true", default=False)
+    parser.add_argument(
+        "--support_only",
+        action="store_true",
+        default=False,
+        help=(
+            "optimize shared geometry/RGB/opacity support while keeping semantic "
+            "logits and codebooks fixed; semantic loss can still guide support"
+        ),
+    )
     parser.add_argument("--reset_iteration", action="store_true", default=False)
     parser.add_argument("--semantic_loss", choices=("cos", "l1", "cos+l1"), default="cos")
     parser.add_argument("--normalize", action="store_true", default=False)
@@ -379,8 +481,26 @@ if __name__ == "__main__":
     parser.add_argument("--no_rgb_loss", action="store_true", default=False)
     parser.add_argument("--no_language_loss", action="store_true", default=False)
     parser.add_argument("--no_admm_loss", action="store_true", default=False)
+    parser.add_argument(
+        "--stop_semantic_support_grad",
+        action="store_true",
+        default=False,
+        help=(
+            "detach geometry, opacity, scale, rotation, and RGB attributes on "
+            "semantic render passes while retaining gradients for semantic "
+            "logits and codebooks"
+        ),
+    )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(sys.argv[1:])
+    if args.semantic_only and args.support_only:
+        parser.error("--semantic_only and --support_only are mutually exclusive")
+    if not args.track_source_ids and (
+        args.source_id_input or args.source_id_origin_checkpoint
+    ):
+        parser.error(
+            "--source_id_input/--source_id_origin_checkpoint require --track_source_ids"
+        )
     args.save_iterations.append(args.iterations)
     args.checkpoint_iterations.append(args.iterations)
     args.save_iterations = sorted(set(args.save_iterations))

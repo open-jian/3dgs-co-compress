@@ -16,7 +16,18 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, opt, scaling_modifier = 1.0, override_color = None, semantic_level = 0):
+def render(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    opt,
+    scaling_modifier=1.0,
+    override_color=None,
+    semantic_level=0,
+    detach_support=False,
+    detach_semantics=False,
+):
     """
     Render the scene. 
     
@@ -53,9 +64,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz
+    # Ablations sometimes need the semantic objective to update only its
+    # logits/codebooks while keeping the shared Gaussian support outside that
+    # objective's autograd graph.  Detaching the renderer inputs (rather than
+    # zeroing gradients after backward) gives a real gradient boundary and
+    # still leaves ``language_feature_weights`` differentiable.
+    means3D = pc.get_xyz.detach() if detach_support else pc.get_xyz
     means2D = screenspace_points
-    opacity = pc.get_opacity
+    opacity = pc.get_opacity.detach() if detach_support else pc.get_opacity
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -64,9 +80,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     cov3D_precomp = None
     if pipe.compute_cov3D_python:
         cov3D_precomp = pc.get_covariance(scaling_modifier)
+        if detach_support:
+            cov3D_precomp = cov3D_precomp.detach()
     else:
         scales = pc.get_scaling
         rotations = pc.get_rotation
+        if detach_support:
+            scales = scales.detach()
+            rotations = rotations.detach()
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -79,10 +100,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            if detach_support:
+                colors_precomp = colors_precomp.detach()
         else:
             shs = pc.get_features
+            if detach_support:
+                shs = shs.detach()
     else:
-        colors_precomp = override_color
+        colors_precomp = override_color.detach() if detach_support else override_color
     
     if opt.quick_render:
         assert pc._language_feature_weights is not None and pc._language_feature_indices is not None, "None Value Error"
@@ -96,11 +121,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         language_feature_weights = pc.get_render_weights(opt.topk, semantic_level)
         language_feature_weights_quick = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
         language_feature_indices = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
-    
     else:
         language_feature_weights = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
         language_feature_weights_quick = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
         language_feature_indices = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
+
+    if detach_semantics:
+        language_feature_weights = language_feature_weights.detach()
+        language_feature_weights_quick = language_feature_weights_quick.detach()
         
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     # start_time = time.time()
