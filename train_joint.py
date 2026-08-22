@@ -176,6 +176,12 @@ def training(
                     )
                 )
         gaussians.restore(model_params, opt)
+        # A joint semantic checkpoint can contain several gigabytes of Adam
+        # moments. ``restore`` deliberately starts a fresh optimizer for this
+        # stage, so retaining the loaded tuple only wastes GPU memory and can
+        # leave too little room for the C3DGS-ADMM auxiliary variables.
+        del model_params
+        torch.cuda.empty_cache()
         if args.reset_iteration:
             first_iter = 0
     elif opt.include_feature:
