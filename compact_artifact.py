@@ -1,10 +1,8 @@
-"""Export and load the deployment-only ClunoGS scene artifact.
+"""Export, validate, and load deployment-only ClunoGS scene artifacts.
 
-The training checkpoint intentionally contains optimizer state, dense semantic
-logits, and unquantized SH tensors.  Those objects are not deployment payloads
-and must never be used for size or quality evaluation.  This module converts a
-finished joint checkpoint plus its SH assignment file into the only artifact
-consumed by evaluation.
+Version 2 stores the block-wise C3DGS-ADMM representation: indexed color,
+indexed normalized covariance plus one scale factor per point, and indexed
+fixed-atom semantic coefficients. Version-1 SH-only artifacts remain readable.
 """
 
 import argparse
@@ -15,9 +13,16 @@ from pathlib import Path
 
 import torch
 
+from c3dgs_quantization import (
+    QUANTIZATION_FORMAT,
+    QUANTIZATION_VERSION,
+    covariance_to_rotation_scale,
+)
+
 
 FORMAT_NAME = "clunogs.compact-scene"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+SUPPORTED_FORMAT_VERSIONS = (1, 2)
 
 
 def _sha256(path):
@@ -46,8 +51,45 @@ def _sha256_tensor(tensor):
     return digest.hexdigest()
 
 
+def _check_bundle_format(bundle):
+    if (
+        bundle.get("format") != FORMAT_NAME
+        or bundle.get("version") not in SUPPORTED_FORMAT_VERSIONS
+    ):
+        raise ValueError("unsupported compact artifact format")
+
+
+def _packed_indices(indices, table_size):
+    """Use the smallest broadly supported torch integer dtype."""
+    indices = indices.detach().reshape(-1).to(torch.int64).cpu().contiguous()
+    if indices.numel():
+        if int(indices.min()) < 0 or int(indices.max()) >= table_size:
+            raise ValueError("VQ table index is outside the encoded table")
+    if table_size <= 256:
+        return indices.to(torch.uint8)
+    if table_size <= 32768:
+        return indices.to(torch.int16)
+    return indices.to(torch.int32)
+
+
+def _encoded_block(state, name, point_count):
+    if not isinstance(state, dict):
+        raise ValueError("{} C3DGS block is missing".format(name))
+    values = state.get("values")
+    indices = state.get("indices")
+    feature_shape = tuple(state.get("feature_shape", ()))
+    if not torch.is_tensor(values) or values.ndim != 2:
+        raise ValueError("{} codebook values must be a matrix".format(name))
+    if not torch.is_tensor(indices) or indices.numel() != point_count:
+        raise ValueError("{} indices must contain one entry per point".format(name))
+    if values.shape[1] != int(torch.tensor(feature_shape).prod()):
+        raise ValueError("{} codebook shape metadata is inconsistent".format(name))
+    packed = _packed_indices(indices, int(values.shape[0]))
+    return values.detach().cpu().contiguous().float(), packed, feature_shape
+
+
 def _semantic_topk(logits, topk, chunk_size=262144):
-    """Return sparse normalized weights and global dictionary indices on CPU."""
+    """Legacy v1 sparse semantic representation."""
     if logits.ndim == 2:
         logits = logits.unsqueeze(1)
     if logits.ndim != 3:
@@ -57,25 +99,140 @@ def _semantic_topk(logits, topk, chunk_size=262144):
         raise ValueError("topk must be in [1, codebook size]")
     if level_count * codebook_size > 256:
         raise ValueError("global semantic indices do not fit uint8")
-
-    all_weights = []
-    all_indices = []
+    all_weights, all_indices = [], []
     offsets = torch.arange(level_count, dtype=torch.int64).view(1, level_count, 1)
     offsets = offsets * codebook_size
     for start in range(0, point_count, chunk_size):
         chunk = logits[start:start + chunk_size].float()
         probabilities = torch.softmax(chunk, dim=-1)
         weights, indices = torch.topk(probabilities, topk, dim=-1)
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-10)
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-10)
         indices = indices.to(torch.int64) + offsets
         all_weights.append(weights.reshape(chunk.shape[0], -1).to(torch.float16))
         all_indices.append(indices.reshape(chunk.shape[0], -1).to(torch.uint8))
     return torch.cat(all_weights, dim=0), torch.cat(all_indices, dim=0)
 
 
-def export_compact_artifact(checkpoint_path, sh_quantization_path,
-                            output_path, topk=4, force=False,
-                            source_id_sidecar_path=None):
+def _pack_c3dgs_quantization(
+    state, point_count, features_dc, features_rest, semantic_codebooks, topk
+):
+    if state.get("format") != QUANTIZATION_FORMAT:
+        raise ValueError("unsupported C3DGS-ADMM quantization sidecar")
+    if state.get("version") != QUANTIZATION_VERSION:
+        raise ValueError("unsupported C3DGS-ADMM sidecar version")
+    if int(state.get("point_count", -1)) != point_count:
+        raise ValueError("C3DGS-ADMM sidecar and checkpoint point counts differ")
+    if int(state.get("semantic_topk", -1)) != topk:
+        raise ValueError("C3DGS-ADMM sidecar top-K differs from export top-K")
+    blocks = state.get("blocks", {})
+
+    color_values, color_indices, color_shape = _encoded_block(
+        blocks.get("color"), "color", point_count
+    )
+    expected_color_shape = (
+        features_dc.shape[1] + features_rest.shape[1],
+        features_dc.shape[2],
+    )
+    if color_shape != expected_color_shape:
+        raise ValueError("C3DGS color vector shape differs from checkpoint")
+
+    covariance_values, covariance_indices, covariance_shape = _encoded_block(
+        blocks.get("covariance"), "covariance", point_count
+    )
+    if covariance_shape != (6,):
+        raise ValueError("C3DGS covariance vectors must have six channels")
+    scale_factor = state.get("scale_factor")
+    if not torch.is_tensor(scale_factor) or tuple(scale_factor.shape) != (
+        point_count,
+        1,
+    ):
+        raise ValueError("C3DGS scale factor must have shape [N,1]")
+
+    semantic_dictionary = semantic_codebooks.detach().cpu().contiguous()
+    if semantic_dictionary.ndim == 3:
+        semantic_dictionary = semantic_dictionary.unsqueeze(0)
+    if semantic_dictionary.ndim != 4:
+        raise ValueError("semantic codebooks must be [level,RVQ,code,feature]")
+    semantic_levels, rvq_layers, semantic_atoms, _ = semantic_dictionary.shape
+    semantic_blocks = blocks.get("semantic")
+    if not isinstance(semantic_blocks, (list, tuple)) or len(semantic_blocks) != semantic_levels:
+        raise ValueError("C3DGS semantic blocks must match semantic levels")
+    fixed_indices = state.get("semantic_fixed_indices")
+    expected_fixed_shape = (
+        point_count,
+        semantic_levels,
+        rvq_layers,
+        topk,
+    )
+    if not torch.is_tensor(fixed_indices) or tuple(fixed_indices.shape) != expected_fixed_shape:
+        raise ValueError("fixed semantic atom indices have an invalid shape")
+    fixed_indices = fixed_indices.to(torch.int64)
+    if fixed_indices.numel() and (
+        int(fixed_indices.min()) < 0 or int(fixed_indices.max()) >= semantic_atoms
+    ):
+        raise ValueError("fixed semantic atom index is outside its dictionary")
+
+    semantic_tables = []
+    semantic_point_indices = []
+    table_offset = 0
+    for level, block in enumerate(semantic_blocks):
+        values, indices, feature_shape = _encoded_block(
+            block, "semantic level {}".format(level), point_count
+        )
+        if feature_shape != (rvq_layers, topk):
+            raise ValueError("semantic coefficient vector shape is inconsistent")
+        semantic_tables.append(values)
+        semantic_point_indices.append(indices.to(torch.int64) + table_offset)
+        table_offset += int(values.shape[0])
+    semantic_coefficient_codebook = torch.cat(semantic_tables, dim=0)
+    semantic_coefficient_indices = torch.stack(
+        semantic_point_indices, dim=1
+    )
+    semantic_coefficient_indices = _packed_indices(
+        semantic_coefficient_indices,
+        int(semantic_coefficient_codebook.shape[0]),
+    ).reshape(point_count, semantic_levels)
+
+    atom_offsets = torch.arange(
+        semantic_levels * rvq_layers, dtype=torch.int64
+    ).reshape(1, semantic_levels, rvq_layers, 1)
+    atom_offsets = atom_offsets * semantic_atoms
+    semantic_indices = (fixed_indices + atom_offsets).reshape(point_count, -1)
+    semantic_indices = _packed_indices(
+        semantic_indices, semantic_levels * rvq_layers * semantic_atoms
+    ).reshape(point_count, -1)
+
+    tensors = {
+        "color_codebook": color_values.to(torch.float16),
+        "color_indices": color_indices,
+        "covariance_codebook": covariance_values.to(torch.float16),
+        "covariance_indices": covariance_indices,
+        "scale_factor": scale_factor.detach().cpu().contiguous().to(torch.float16),
+        "semantic_coefficient_codebook": semantic_coefficient_codebook.to(torch.float16),
+        "semantic_coefficient_indices": semantic_coefficient_indices,
+        "semantic_indices": semantic_indices,
+        "semantic_codebooks": semantic_dictionary.to(torch.float16),
+    }
+    metadata = {
+        "attribute_mode": "c3dgs_admm_vq",
+        "color_feature_shape": color_shape,
+        "covariance_feature_shape": covariance_shape,
+        "semantic_level_count": semantic_levels,
+        "semantic_rvq_layers": rvq_layers,
+        "semantic_coefficient_shape": (rvq_layers, topk),
+        "quantization_algorithm": state.get("algorithm", {}),
+    }
+    return tensors, metadata
+
+
+def export_compact_artifact(
+    checkpoint_path,
+    quantization_path,
+    output_path,
+    topk=4,
+    force=False,
+    source_id_sidecar_path=None,
+):
     output_path = os.path.abspath(output_path)
     manifest_path = output_path + ".manifest.json"
     if (os.path.exists(output_path) or os.path.exists(manifest_path)) and not force:
@@ -84,12 +241,24 @@ def export_compact_artifact(checkpoint_path, sh_quantization_path,
     model_params, iteration = torch.load(checkpoint_path, map_location="cpu")
     if len(model_params) != 14:
         raise ValueError("expected a 14-field joint checkpoint")
-    (active_sh_degree, xyz, features_dc, features_rest, scaling, rotation,
-     opacity, semantic_logits, semantic_codebooks, _max_radii2d,
-     _xyz_gradient_accum, _denom, _optimizer_state,
-     _spatial_lr_scale) = model_params
-
+    (
+        active_sh_degree,
+        xyz,
+        features_dc,
+        features_rest,
+        scaling,
+        rotation,
+        opacity,
+        semantic_logits,
+        semantic_codebooks,
+        _max_radii2d,
+        _xyz_gradient_accum,
+        _denom,
+        _optimizer_state,
+        _spatial_lr_scale,
+    ) = model_params
     point_count = int(xyz.shape[0])
+
     source_id_lineage = None
     embedded_source_ids = None
     if source_id_sidecar_path:
@@ -125,61 +294,90 @@ def export_compact_artifact(checkpoint_path, sh_quantization_path,
             "embedded_in_deployment_artifact": True,
             "counted_in_deployment_bytes": True,
         }
-    expected_feature_shape = tuple(features_rest.shape[1:])
-    if sh_quantization_path:
-        sh_state = torch.load(sh_quantization_path, map_location="cpu")
-        sh_centers = sh_state["centers"].contiguous().float()
-        sh_indices_long = sh_state["indices"].reshape(-1).to(torch.int64)
-        if sh_indices_long.shape[0] != point_count:
-            raise ValueError("SH assignment count does not match Gaussian count")
-        if sh_centers.shape[0] > 256 or int(sh_indices_long.max()) >= 256:
-            raise ValueError("SH assignments do not fit uint8")
-        stored_feature_shape = tuple(sh_state["feature_shape"])
-        if stored_feature_shape != expected_feature_shape:
-            raise ValueError("SH feature shape does not match checkpoint")
-        sh_tensors = {
-            "sh_codebook": sh_centers,
-            "sh_indices": sh_indices_long.to(torch.uint8),
-        }
-        sh_mode = "vq_uint8"
-    else:
-        stored_feature_shape = expected_feature_shape
-        sh_tensors = {
-            "features_rest": features_rest.detach().cpu().contiguous().float(),
-        }
-        sh_mode = "full_float32"
 
-    semantic_weights, semantic_indices = _semantic_topk(
-        semantic_logits.detach().cpu(), topk
+    quantization_state = (
+        torch.load(quantization_path, map_location="cpu")
+        if quantization_path
+        else None
     )
-    semantic_codebooks = semantic_codebooks.detach().cpu().contiguous().to(torch.float16)
+    if (
+        isinstance(quantization_state, dict)
+        and quantization_state.get("format") == QUANTIZATION_FORMAT
+    ):
+        attribute_tensors, attribute_metadata = _pack_c3dgs_quantization(
+            quantization_state,
+            point_count,
+            features_dc,
+            features_rest,
+            semantic_codebooks,
+            topk,
+        )
+        artifact_version = 2
+    else:
+        expected_feature_shape = tuple(features_rest.shape[1:])
+        if quantization_state is not None:
+            sh_centers = quantization_state["centers"].contiguous().float()
+            sh_indices = quantization_state["indices"].reshape(-1).to(torch.int64)
+            if sh_indices.shape[0] != point_count:
+                raise ValueError("SH assignment count does not match Gaussian count")
+            if sh_centers.shape[0] > 256 or int(sh_indices.max()) >= 256:
+                raise ValueError("legacy SH assignments do not fit uint8")
+            stored_feature_shape = tuple(quantization_state["feature_shape"])
+            if stored_feature_shape != expected_feature_shape:
+                raise ValueError("SH feature shape does not match checkpoint")
+            sh_tensors = {
+                "sh_codebook": sh_centers,
+                "sh_indices": sh_indices.to(torch.uint8),
+            }
+            sh_mode = "vq_uint8"
+        else:
+            stored_feature_shape = expected_feature_shape
+            sh_tensors = {
+                "features_rest": features_rest.detach().cpu().contiguous().float()
+            }
+            sh_mode = "full_float32"
+        semantic_weights, semantic_indices = _semantic_topk(
+            semantic_logits.detach().cpu(), topk
+        )
+        attribute_tensors = {
+            "features_dc": features_dc.detach().cpu().contiguous().float(),
+            "scaling": scaling.detach().cpu().contiguous().float(),
+            "rotation": rotation.detach().cpu().contiguous().float(),
+            "semantic_weights": semantic_weights.contiguous(),
+            "semantic_indices": semantic_indices.contiguous(),
+            "semantic_codebooks": semantic_codebooks.detach()
+            .cpu()
+            .contiguous()
+            .to(torch.float16),
+            **sh_tensors,
+        }
+        attribute_metadata = {
+            "attribute_mode": "legacy_sh_only",
+            "sh_mode": sh_mode,
+            "sh_feature_shape": stored_feature_shape,
+            "semantic_level_count": int(
+                1 if semantic_logits.ndim == 2 else semantic_logits.shape[1]
+            ),
+            "semantic_rvq_layers": 1,
+        }
+        artifact_version = 1
 
     tensors = {
         "xyz": xyz.detach().cpu().contiguous().float(),
-        "features_dc": features_dc.detach().cpu().contiguous().float(),
-        "scaling": scaling.detach().cpu().contiguous().float(),
-        "rotation": rotation.detach().cpu().contiguous().float(),
         "opacity": opacity.detach().cpu().contiguous().float(),
-        "semantic_weights": semantic_weights.contiguous(),
-        "semantic_indices": semantic_indices.contiguous(),
-        "semantic_codebooks": semantic_codebooks,
+        **attribute_tensors,
     }
     if embedded_source_ids is not None:
         tensors["source_ids"] = embedded_source_ids
-    tensors.update(sh_tensors)
     bundle = {
         "format": FORMAT_NAME,
-        "version": FORMAT_VERSION,
+        "version": artifact_version,
         "iteration": int(iteration),
         "active_sh_degree": int(active_sh_degree),
         "max_sh_degree": 3,
         "point_count": point_count,
         "topk": int(topk),
-        "semantic_level_count": int(
-            1 if semantic_logits.ndim == 2 else semantic_logits.shape[1]
-        ),
-        "sh_mode": sh_mode,
-        "sh_feature_shape": stored_feature_shape,
+        **attribute_metadata,
         "tensors": tensors,
     }
     if source_id_lineage is not None:
@@ -188,9 +386,18 @@ def export_compact_artifact(checkpoint_path, sh_quantization_path,
     torch.save(bundle, output_path)
 
     logical_bytes = {name: _tensor_nbytes(value) for name, value in tensors.items()}
+    excluded_attributes = (
+        [
+            "unquantized_color",
+            "unquantized_covariance",
+            "dense_semantic_coefficients",
+        ]
+        if artifact_version == 2
+        else (["unquantized_features_rest"] if quantization_path else [])
+    )
     manifest = {
         "format": FORMAT_NAME,
-        "version": FORMAT_VERSION,
+        "version": artifact_version,
         "scene_artifact": os.path.basename(output_path),
         "scene_bytes": int(os.path.getsize(output_path)),
         "shared_bytes": 0,
@@ -198,6 +405,7 @@ def export_compact_artifact(checkpoint_path, sh_quantization_path,
         "sha256": _sha256(output_path),
         "point_count": point_count,
         "topk": int(topk),
+        "attribute_mode": attribute_metadata["attribute_mode"],
         "logical_tensor_bytes": logical_bytes,
         "logical_tensor_bytes_total": int(sum(logical_bytes.values())),
         "tensor_schema": {
@@ -205,14 +413,20 @@ def export_compact_artifact(checkpoint_path, sh_quantization_path,
             for name, value in tensors.items()
         },
         "excluded_training_state": [
-            "optimizer", "dense_semantic_logits", "gradient_accumulators"
-        ] + (["unquantized_features_rest"] if sh_quantization_path else []),
+            "optimizer",
+            "dense_semantic_logits",
+            "gradient_accumulators",
+        ]
+        + excluded_attributes,
         "source": {
             "checkpoint": os.path.abspath(checkpoint_path),
             "checkpoint_sha256": _sha256(checkpoint_path),
+            "quantization": (
+                os.path.abspath(quantization_path) if quantization_path else None
+            ),
+            # Compatibility key for existing result collectors.
             "sh_quantization": (
-                os.path.abspath(sh_quantization_path)
-                if sh_quantization_path else None
+                os.path.abspath(quantization_path) if quantization_path else None
             ),
             "iteration": int(iteration),
         },
@@ -232,14 +446,28 @@ def export_compact_artifact(checkpoint_path, sh_quantization_path,
     return manifest
 
 
+def _decode_semantic_coefficients(bundle):
+    tensors = bundle["tensors"]
+    point_count = int(bundle["point_count"])
+    semantic_levels = int(bundle["semantic_level_count"])
+    rvq_layers = int(bundle.get("semantic_rvq_layers", 1))
+    topk = int(bundle["topk"])
+    coefficient_indices = tensors["semantic_coefficient_indices"].to(torch.int64)
+    coefficients = tensors["semantic_coefficient_codebook"][coefficient_indices]
+    coefficients = coefficients.float().reshape(
+        point_count, semantic_levels, rvq_layers, topk
+    )
+    coefficients = coefficients.clamp_min(0)
+    return coefficients / coefficients.sum(dim=-1, keepdim=True).clamp_min(1e-10)
+
+
 def load_compact_gaussians(artifact_path, device="cuda"):
     """Load a compact scene without consulting a training checkpoint."""
     from torch import nn
     from scene.gaussian_model import GaussianModel
 
     bundle = torch.load(artifact_path, map_location="cpu")
-    if bundle.get("format") != FORMAT_NAME or bundle.get("version") != FORMAT_VERSION:
-        raise ValueError("unsupported compact artifact format")
+    _check_bundle_format(bundle)
     tensors = bundle["tensors"]
     point_count = int(bundle["point_count"])
     if tensors["xyz"].shape[0] != point_count:
@@ -248,23 +476,50 @@ def load_compact_gaussians(artifact_path, device="cuda"):
     model = GaussianModel(int(bundle["max_sh_degree"]))
     model.active_sh_degree = int(bundle["active_sh_degree"])
     model._xyz = nn.Parameter(tensors["xyz"].to(device), requires_grad=False)
-    model._features_dc = nn.Parameter(
-        tensors["features_dc"].to(device), requires_grad=False
-    )
-    if bundle.get("sh_mode", "vq_uint8") == "full_float32":
-        sh_values = tensors["features_rest"]
+    if bundle.get("attribute_mode") == "c3dgs_admm_vq":
+        color_indices = tensors["color_indices"].to(torch.int64)
+        color = tensors["color_codebook"][color_indices].float()
+        color = color.reshape(point_count, *bundle["color_feature_shape"])
+        model._features_dc = nn.Parameter(color[:, :1].to(device), requires_grad=False)
+        model._features_rest = nn.Parameter(color[:, 1:].to(device), requires_grad=False)
+
+        covariance_indices = tensors["covariance_indices"].to(torch.int64)
+        covariance = tensors["covariance_codebook"][covariance_indices].float()
+        rotation, normalized_scale = covariance_to_rotation_scale(covariance)
+        scale_factor = tensors["scale_factor"].float()
+        scaling = (normalized_scale * scale_factor).clamp_min(1e-12).log()
+        model._scaling = nn.Parameter(scaling.to(device), requires_grad=False)
+        model._rotation = nn.Parameter(rotation.to(device), requires_grad=False)
+
+        semantic_coefficients = _decode_semantic_coefficients(bundle)
+        model._language_feature_weights = semantic_coefficients.reshape(
+            point_count, -1
+        ).to(device)
     else:
-        sh_indices = tensors["sh_indices"].to(torch.int64)
-        sh_values = tensors["sh_codebook"][sh_indices]
-        sh_values = sh_values.reshape(point_count, *bundle["sh_feature_shape"])
-    model._features_rest = nn.Parameter(sh_values.to(device), requires_grad=False)
-    model._scaling = nn.Parameter(tensors["scaling"].to(device), requires_grad=False)
-    model._rotation = nn.Parameter(tensors["rotation"].to(device), requires_grad=False)
+        model._features_dc = nn.Parameter(
+            tensors["features_dc"].to(device), requires_grad=False
+        )
+        if bundle.get("sh_mode", "vq_uint8") == "full_float32":
+            sh_values = tensors["features_rest"]
+        else:
+            sh_indices = tensors["sh_indices"].to(torch.int64)
+            sh_values = tensors["sh_codebook"][sh_indices]
+            sh_values = sh_values.reshape(
+                point_count, *bundle["sh_feature_shape"]
+            )
+        model._features_rest = nn.Parameter(sh_values.to(device), requires_grad=False)
+        model._scaling = nn.Parameter(
+            tensors["scaling"].to(device), requires_grad=False
+        )
+        model._rotation = nn.Parameter(
+            tensors["rotation"].to(device), requires_grad=False
+        )
+        model._language_feature_weights = tensors["semantic_weights"].float().to(device)
+
     model._opacity = nn.Parameter(tensors["opacity"].to(device), requires_grad=False)
     model._language_feature_codebooks = nn.Parameter(
         tensors["semantic_codebooks"].float().to(device), requires_grad=False
     )
-    model._language_feature_weights = tensors["semantic_weights"].float().to(device)
     model._language_feature_indices = tensors["semantic_indices"].float().to(device)
     return model, bundle
 
@@ -273,29 +528,54 @@ def validate_artifact(
     artifact_path, checkpoint_path=None, source_id_sidecar_path=None
 ):
     bundle = torch.load(artifact_path, map_location="cpu")
-    if bundle.get("format") != FORMAT_NAME or bundle.get("version") != FORMAT_VERSION:
-        raise ValueError("unsupported compact artifact format")
+    _check_bundle_format(bundle)
     tensors = bundle["tensors"]
     point_count = int(bundle["point_count"])
-    point_tensors = (
-        "xyz", "features_dc", "scaling", "rotation", "opacity",
-        "semantic_weights", "semantic_indices"
-    )
-    if bundle.get("sh_mode", "vq_uint8") == "full_float32":
-        point_tensors += ("features_rest",)
+    point_tensors = ["xyz", "opacity", "semantic_indices"]
+    if bundle.get("attribute_mode") == "c3dgs_admm_vq":
+        point_tensors.extend(
+            (
+                "color_indices",
+                "covariance_indices",
+                "scale_factor",
+                "semantic_coefficient_indices",
+            )
+        )
+        _packed_indices(
+            tensors["color_indices"], int(tensors["color_codebook"].shape[0])
+        )
+        _packed_indices(
+            tensors["covariance_indices"],
+            int(tensors["covariance_codebook"].shape[0]),
+        )
+        _packed_indices(
+            tensors["semantic_coefficient_indices"],
+            int(tensors["semantic_coefficient_codebook"].shape[0]),
+        )
+        semantic_weights = _decode_semantic_coefficients(bundle).reshape(
+            point_count, -1
+        )
     else:
-        point_tensors += ("sh_indices",)
+        point_tensors.extend(("features_dc", "scaling", "rotation", "semantic_weights"))
+        if bundle.get("sh_mode", "vq_uint8") == "full_float32":
+            point_tensors.append("features_rest")
+        else:
+            point_tensors.append("sh_indices")
+        semantic_weights = tensors["semantic_weights"].float()
     for name in point_tensors:
         if tensors[name].shape[0] != point_count:
             raise ValueError("{} has an inconsistent point count".format(name))
+
     semantic_levels = int(bundle["semantic_level_count"])
-    expected_sparse_width = semantic_levels * int(bundle["topk"])
-    if tensors["semantic_weights"].shape[1] != expected_sparse_width:
-        raise ValueError("semantic weight width is inconsistent")
-    if tensors["semantic_indices"].shape != tensors["semantic_weights"].shape:
-        raise ValueError("semantic indices and weights have different shapes")
-    if not torch.isfinite(tensors["semantic_weights"].float()).all():
-        raise ValueError("semantic weights contain non-finite values")
+    rvq_layers = int(bundle.get("semantic_rvq_layers", 1))
+    expected_sparse_width = semantic_levels * rvq_layers * int(bundle["topk"])
+    if semantic_weights.shape[1] != expected_sparse_width:
+        raise ValueError("semantic coefficient width is inconsistent")
+    if tensors["semantic_indices"].shape != semantic_weights.shape:
+        raise ValueError("semantic indices and coefficients have different shapes")
+    if not torch.isfinite(semantic_weights).all():
+        raise ValueError("semantic coefficients contain non-finite values")
+
     lineage = bundle.get("source_id_lineage")
     lineage_audit = None
     if lineage is not None:
@@ -376,6 +656,7 @@ def validate_artifact(
         "sha256": _sha256(artifact_path),
         "point_count": point_count,
         "topk": int(bundle["topk"]),
+        "attribute_mode": bundle.get("attribute_mode", "legacy_sh_only"),
         "source_id_lineage": lineage_audit,
     }
 
@@ -385,7 +666,13 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
     export_parser = subparsers.add_parser("export")
     export_parser.add_argument("--checkpoint", required=True)
-    export_parser.add_argument("--sh-quantization", default=None)
+    export_parser.add_argument(
+        "--quantization",
+        "--sh-quantization",
+        dest="quantization",
+        default=None,
+        help="C3DGS-ADMM sidecar; --sh-quantization is a legacy alias",
+    )
     export_parser.add_argument("--output", required=True)
     export_parser.add_argument("--topk", type=int, default=4)
     export_parser.add_argument("--source-id-sidecar", default=None)
@@ -398,8 +685,11 @@ def main():
 
     if args.command == "export":
         result = export_compact_artifact(
-            args.checkpoint, args.sh_quantization, args.output,
-            topk=args.topk, force=args.force,
+            args.checkpoint,
+            args.quantization,
+            args.output,
+            topk=args.topk,
+            force=args.force,
             source_id_sidecar_path=args.source_id_sidecar,
         )
     else:

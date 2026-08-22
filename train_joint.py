@@ -1,4 +1,4 @@
-"""Joint three-scale LangSplatV2 + CoLaSplat optimization.
+"""Joint three-scale LangSplatV2 + C3DGS-ADMM optimization.
 
 This entry point keeps one Gaussian geometry and three semantic VQ heads.  The
 three heads are supervised together, then every pruning event applies one mask
@@ -74,6 +74,11 @@ def initialize_scale_codebooks(gaussians, dataset, opt, feature_levels):
 
 
 def semantic_reconstruction_loss(prediction, target, mask, mode):
+    # Feature files are loaded through NumPy and may remain on CPU under some
+    # camera/data-device combinations. Keep the task loss colocated with the
+    # renderer output instead of relying on an implicit CUDA default.
+    target = target.to(device=prediction.device, dtype=prediction.dtype)
+    mask = mask.to(device=prediction.device, dtype=prediction.dtype)
     loss = prediction.new_zeros(())
     if mode in ("cos", "cos+l1"):
         loss = loss + cos_loss(prediction * mask, target * mask)
@@ -82,17 +87,14 @@ def semantic_reconstruction_loss(prediction, target, mask, mode):
     return loss
 
 
-def save_sh_quantization(admm, model_path, iteration):
-    if admm is None or admm.sh_projector.centers is None:
+def save_c3dgs_quantization(admm, model_path, iteration):
+    if admm is None or not admm.attribute_vq_enabled:
         return
-    # Reassign the final (possibly fine-tuned after the last ADMM update) SH
-    # vectors to the frozen codebook before serializing the compact indices.
-    admm.sh_projector.project(
-        admm.gaussian_model._features_rest, update_centers=False
-    )
+    # Keep the legacy filename so existing launchers can consume the new,
+    # self-describing block-wise sidecar without a synchronized script update.
     output_path = os.path.join(model_path, "sh_quantization_{}.pth".format(iteration))
-    torch.save(admm.sh_projector.state_dict(), output_path)
-    print("Saved SH codebook and indices to {}".format(output_path))
+    torch.save(admm.quantization_state(), output_path)
+    print("Saved C3DGS-ADMM attribute codebooks and indices to {}".format(output_path))
 
 
 def training(
@@ -151,6 +153,10 @@ def training(
         load_kwargs = {}
         if "weights_only" in inspect.signature(torch.load).parameters:
             load_kwargs["weights_only"] = False
+        # RGB/pruned host adapters often serialize tensors from CPU. The CUDA
+        # rasterizer requires every Gaussian parameter and semantic dictionary
+        # on the active device, regardless of where the checkpoint was written.
+        load_kwargs["map_location"] = "cuda"
         model_params, first_iter = torch.load(checkpoint, **load_kwargs)
         checkpoint_has_semantics = len(model_params) == 14
         if len(model_params) == 12:
@@ -209,6 +215,7 @@ def training(
     ema_rgb = 0.0
     ema_semantic = [0.0] * len(feature_levels)
     admm = None
+    attribute_vq_disabled = args.disable_sh_admm or args.disable_c3dgs_admm
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Joint training")
 
     first_iter += 1
@@ -237,28 +244,26 @@ def training(
             not args.semantic_only
             and opt.enable_admm_loss
             and opt.admm_start_iter <= iteration <= opt.admm_end_iter
+            and admm is None
         ):
-            if admm is None:
-                print("[ITER {}] Initializing ADMM".format(iteration))
-                admm = ADMM(
-                    gaussians,
-                    opt.rho_opacity,
-                    opt.rho_sh,
-                    opt.sh_codebook_size,
-                )
-                admm.update_opacity(opt.pruning_fraction2, update_dual=False)
-                if not args.disable_sh_admm:
-                    admm.update_sh(update_dual=False, update_centers=True)
-            elif iteration % opt.admm_interval == 0:
-                update_dual = not args.disable_dual_updates
-                admm.update_opacity(
-                    opt.pruning_fraction2, update_dual=update_dual
-                )
-                if not args.disable_sh_admm:
-                    admm.update_sh(
-                        update_dual=update_dual,
-                        update_centers=iteration < opt.freeze_sh_codebook_iter,
-                    )
+            print("[ITER {}] Initializing C3DGS-ADMM".format(iteration))
+            admm = ADMM(
+                gaussians,
+                opt.rho_opacity,
+                opt.rho_sh,
+                opt.sh_codebook_size,
+                rho_covariance=opt.rho_covariance,
+                rho_semantic=opt.rho_semantic,
+                covariance_clusters=opt.gaussian_codebook_size,
+                semantic_clusters=opt.semantic_coefficient_codebook_size,
+                semantic_topk=args.topk,
+                codebook_decay=opt.c3dgs_codebook_decay,
+                sensitivity_decay=opt.c3dgs_sensitivity_decay,
+                keep_ratio=opt.c3dgs_keep_ratio,
+                refinement_steps=opt.c3dgs_refinement_steps,
+                chunk_size=opt.c3dgs_chunk_size,
+                enable_attribute_vq=not attribute_vq_disabled,
+            )
 
         gaussians.update_learning_rate(iteration)
         if iteration % 1000 == 0:
@@ -339,25 +344,63 @@ def training(
             loss = loss + opt.rgb_loss_coeff * rgb_loss
 
         opacity_admm_loss = rgb_image.new_zeros(())
-        sh_admm_loss = rgb_image.new_zeros(())
+        color_admm_loss = rgb_image.new_zeros(())
+        covariance_admm_loss = rgb_image.new_zeros(())
+        semantic_admm_loss = rgb_image.new_zeros(())
         if (
             admm is not None
             and opt.enable_admm_loss
             and not args.no_admm_loss
-            and iteration % opt.admm_interval == 0
             and iteration <= opt.admm_end_iter
         ):
             opacity_admm_loss = admm.opacity_loss()
-            if not args.disable_sh_admm:
-                sh_admm_loss = admm.sh_loss()
+            if not attribute_vq_disabled:
+                attribute_admm_losses = admm.attribute_losses()
+                color_admm_loss = attribute_admm_losses["color"]
+                covariance_admm_loss = attribute_admm_losses["covariance"]
+                semantic_admm_loss = attribute_admm_losses["semantic"]
             loss = loss + opt.admm_loss_coeff * (
-                opacity_admm_loss + sh_admm_loss
+                opacity_admm_loss
+                + color_admm_loss
+                + covariance_admm_loss
+                + semantic_admm_loss
             )
         if not loss.requires_grad:
             raise RuntimeError("All training losses are disabled")
         loss.backward()
 
+        if admm is not None and iteration <= opt.admm_end_iter:
+            admm.observe_sensitivity()
+
         with torch.no_grad():
+            # Complete the primal step before either auxiliary projection or
+            # physical support deletion. This matches the stated ADMM order and
+            # keeps the milestone gradient attached to the parameters it updates.
+            if iteration < opt.iterations and iteration % args.accum_iter == 0:
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none=True)
+
+            projection_due = (
+                admm is not None
+                and iteration <= opt.admm_end_iter
+                and (
+                    iteration == opt.admm_start_iter
+                    or iteration % opt.admm_interval == 0
+                )
+            )
+            if projection_due:
+                update_dual = not args.disable_dual_updates
+                admm.update_opacity(
+                    opt.pruning_fraction2, update_dual=update_dual
+                )
+                if not attribute_vq_disabled:
+                    admm.update_attributes(
+                        update_dual=update_dual,
+                        update_codebooks=(
+                            iteration < opt.freeze_sh_codebook_iter
+                        ),
+                    )
+
             if (
                 not args.semantic_only
                 and
@@ -376,16 +419,17 @@ def training(
                 iteration == opt.simp_iteration2
                 and opt.pruning_fraction2 > 0
             ):
-                mask = get_pruning_mask(
-                    gaussians._opacity[:, 0], opt.pruning_fraction2
-                )
+                if admm is not None and bool(admm.opacity_prune_mask.any()):
+                    # The physical support is exactly the support selected by
+                    # the most recent corrected-opacity projection.
+                    mask = admm.opacity_prune_mask.clone()
+                else:
+                    mask = get_pruning_mask(
+                        gaussians.get_opacity[:, 0], opt.pruning_fraction2
+                    )
                 gaussians.prune_points_admm(mask)
                 if admm is not None:
                     admm.prune(mask)
-
-            if iteration < opt.iterations and iteration % args.accum_iter == 0:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none=True)
 
             ema_total = 0.4 * loss.item() + 0.6 * ema_total
             ema_rgb = 0.4 * rgb_loss.item() + 0.6 * ema_rgb
@@ -410,7 +454,15 @@ def training(
                 tb_writer.add_scalar("loss/total", loss.item(), iteration)
                 tb_writer.add_scalar("loss/rgb", rgb_loss.item(), iteration)
                 tb_writer.add_scalar("loss/admm_opacity", opacity_admm_loss.item(), iteration)
-                tb_writer.add_scalar("loss/admm_sh", sh_admm_loss.item(), iteration)
+                tb_writer.add_scalar("loss/admm_color", color_admm_loss.item(), iteration)
+                tb_writer.add_scalar(
+                    "loss/admm_covariance", covariance_admm_loss.item(), iteration
+                )
+                tb_writer.add_scalar(
+                    "loss/admm_semantic_coefficients",
+                    semantic_admm_loss.item(),
+                    iteration,
+                )
                 tb_writer.add_scalar("scene/points", gaussians.get_xyz.shape[0], iteration)
                 for index, level_loss in enumerate(semantic_losses):
                     tb_writer.add_scalar(
@@ -428,21 +480,18 @@ def training(
                     scene.model_path, "chkpnt{}.pth".format(iteration)
                 )
                 if args.materialize_sh_projection_at_checkpoint:
-                    if admm is None or args.disable_sh_admm:
+                    if admm is None or attribute_vq_disabled:
                         raise RuntimeError(
                             "--materialize_sh_projection_at_checkpoint requires "
-                            "an initialized SH-ADMM projector"
+                            "an initialized C3DGS-ADMM attribute projector"
                         )
-                    projected_sh = admm.sh_projector.project(
-                        gaussians._features_rest, update_centers=False
-                    )
-                    gaussians._features_rest.copy_(projected_sh)
+                    admm.materialize_attributes()
                 torch.save(
                     (gaussians.capture(opt.include_feature), iteration),
                     checkpoint_path,
                 )
-                if not args.disable_sh_admm:
-                    save_sh_quantization(admm, scene.model_path, iteration)
+                if not attribute_vq_disabled:
+                    save_c3dgs_quantization(admm, scene.model_path, iteration)
                 if args.track_source_ids:
                     save_lineage_sidecar(
                         gaussians,
@@ -526,12 +575,21 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--disable_c3dgs_admm",
+        action="store_true",
+        default=False,
+        help=(
+            "disable all C3DGS attribute-VQ constraints while retaining "
+            "opacity sparsification"
+        ),
+    )
+    parser.add_argument(
         "--disable_sh_admm",
         action="store_true",
         default=False,
         help=(
-            "disable the RGB-SH quantization constraint while retaining "
-            "opacity sparsification; used by the sparsification-only control"
+            "deprecated alias for --disable_c3dgs_admm; retained for existing "
+            "sparsification-only launchers"
         ),
     )
     parser.add_argument(
@@ -539,8 +597,8 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help=(
-            "replace saved higher-order SH values by their final projected "
-            "codebook entries; intended for a VQ-first sequential stage"
+            "replace saved color, covariance, and semantic coefficients by "
+            "their final projected values; retained under its legacy name"
         ),
     )
     parser.add_argument(

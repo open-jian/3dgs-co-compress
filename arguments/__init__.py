@@ -113,9 +113,20 @@ class OptimizationParams(ParamGroup):
         self.pruning_fraction1 = 0.00001
         self.pruning_fraction2 = 0.5
         self.rho_opacity = 0.0005
+        # ``rho_sh`` and ``sh_codebook_size`` remain as command-line aliases
+        # for the color block so existing experiment launchers keep working.
         self.rho_sh = 0.0005
-        self.sh_codebook_size = 8000
+        self.rho_covariance = 0.0005
+        self.rho_semantic = 0.0005
+        self.sh_codebook_size = 256
+        self.gaussian_codebook_size = 256
+        self.semantic_coefficient_codebook_size = 256
         self.freeze_sh_codebook_iter = 9_500
+        self.c3dgs_codebook_decay = 0.8
+        self.c3dgs_sensitivity_decay = 0.9
+        self.c3dgs_keep_ratio = 0.01
+        self.c3dgs_refinement_steps = 3
+        self.c3dgs_chunk_size = 4096
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

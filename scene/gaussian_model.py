@@ -55,6 +55,9 @@ class GaussianModel:
         self._language_feature_codebooks = None
         self._language_feature_weights = None
         self._language_feature_indices = None
+        # C3DGS-ADMM freezes atom IDs at the start of the constrained stage and
+        # vector-quantizes only their continuous coefficients.
+        self._semantic_fixed_indices = None
         # Optional evaluation-only lineage.  It is deliberately excluded from
         # capture() and deployment artifacts; train_joint writes a separately
         # hashed sidecar for controlled source-ID runs.
@@ -227,6 +230,65 @@ class GaussianModel:
         """Return codebooks as [semantic_level, RVQ_layer, codebook, 512]."""
         codebooks = self.get_language_feature_codebooks
         return codebooks.unsqueeze(0) if codebooks.ndim == 3 else codebooks
+
+    @torch.no_grad()
+    def freeze_semantic_indices(self, topk):
+        """Freeze the top-K atom IDs used during constrained optimization."""
+        logits = self._semantic_logits()
+        codebooks = self._semantic_codebooks()
+        rvq_layers, codebook_size = codebooks.shape[1:3]
+        if topk <= 0 or topk > codebook_size:
+            raise ValueError("topk must be in [1, semantic codebook size]")
+        reshaped = logits.reshape(
+            logits.shape[0], logits.shape[1], rvq_layers, codebook_size
+        )
+        self._semantic_fixed_indices = torch.topk(
+            reshaped, topk, dim=-1
+        ).indices.contiguous()
+
+    def get_semantic_coefficients(self):
+        """Return fixed-atom coefficients as [N, level, RVQ, top-K]."""
+        if self._semantic_fixed_indices is None:
+            raise RuntimeError("semantic atom indices have not been frozen")
+        logits = self._semantic_logits()
+        codebooks = self._semantic_codebooks()
+        rvq_layers, codebook_size = codebooks.shape[1:3]
+        reshaped = logits.reshape(
+            logits.shape[0], logits.shape[1], rvq_layers, codebook_size
+        )
+        probabilities = torch.softmax(reshaped, dim=-1)
+        coefficients = torch.gather(
+            probabilities, -1, self._semantic_fixed_indices
+        )
+        return coefficients / coefficients.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-10)
+
+    @torch.no_grad()
+    def materialize_semantic_coefficients(self, coefficients):
+        """Encode fixed-atom simplex coefficients back into dense logits."""
+        if self._semantic_fixed_indices is None:
+            raise RuntimeError("semantic atom indices have not been frozen")
+        logits = self._semantic_logits()
+        codebooks = self._semantic_codebooks()
+        rvq_layers, codebook_size = codebooks.shape[1:3]
+        if tuple(coefficients.shape) != tuple(self._semantic_fixed_indices.shape):
+            raise ValueError("semantic coefficient and fixed-index shapes disagree")
+        coefficients = coefficients.clamp_min(1e-12)
+        coefficients = coefficients / coefficients.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-12)
+        dense = torch.full(
+            (logits.shape[0], logits.shape[1], rvq_layers, codebook_size),
+            -30.0,
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        dense.scatter_(-1, self._semantic_fixed_indices, coefficients.log())
+        dense = dense.reshape_as(logits)
+        if self._language_feature_logits.ndim == 2:
+            dense = dense[:, 0]
+        self._language_feature_logits.copy_(dense)
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -305,6 +367,7 @@ class GaussianModel:
                     )
                 self._language_feature_logits = nn.Parameter(language_feature_logits.requires_grad_(True))
                 self._language_feature_codebooks = nn.Parameter(language_feature_codebooks.requires_grad_(True))
+                self._semantic_fixed_indices = None
 
             # Keep logits and codebooks in separate groups: logits have one row
             # per Gaussian and must follow any pruning mask, while codebooks are
@@ -565,6 +628,14 @@ class GaussianModel:
                 self._language_feature_logits,
                 valid_points_mask,
             )
+        if self._semantic_fixed_indices is not None:
+            if self._semantic_fixed_indices.shape[0] != valid_points_mask.shape[0]:
+                raise ValueError(
+                    "semantic fixed-index rows and pruning mask disagree"
+                )
+            self._semantic_fixed_indices = self._semantic_fixed_indices[
+                valid_points_mask
+            ].contiguous()
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
@@ -689,6 +760,26 @@ class GaussianModel:
     def get_render_weights(self, k, semantic_level=0):
         logits = self._semantic_logits()[:, semantic_level]
         _, layer_num, codebook_size, _ = self._semantic_codebooks().shape
+        if self._semantic_fixed_indices is not None:
+            fixed_indices = self._semantic_fixed_indices[:, semantic_level]
+            if fixed_indices.shape[-1] != k:
+                raise ValueError(
+                    "renderer topk differs from frozen semantic topk"
+                )
+            coefficients = self.get_semantic_coefficients()[:, semantic_level]
+            weights = []
+            for layer in range(layer_num):
+                dense = torch.zeros(
+                    logits.shape[0],
+                    codebook_size,
+                    device=logits.device,
+                    dtype=logits.dtype,
+                )
+                dense.scatter_(
+                    1, fixed_indices[:, layer], coefficients[:, layer]
+                )
+                weights.append(dense)
+            return torch.cat(weights, dim=-1).float()
         weights = []
         for i in range(layer_num):
             soft_code = softmax_to_topk_soft_code(logits[:, i*codebook_size:(i+1)*codebook_size], k)
@@ -746,6 +837,26 @@ class GaussianModel:
             raise ValueError(
                 "The released quick rasterizer requires [3, 64, 512] codebooks"
             )
+        if self._semantic_fixed_indices is not None:
+            fixed_indices = self._semantic_fixed_indices
+            if fixed_indices.shape[2] != 1 or fixed_indices.shape[3] != topk:
+                raise ValueError(
+                    "quick-render configuration differs from frozen semantic indices"
+                )
+            level_offsets = torch.arange(
+                semantic_levels,
+                device=fixed_indices.device,
+                dtype=fixed_indices.dtype,
+            ).view(1, semantic_levels, 1)
+            coefficients = self.get_semantic_coefficients()[:, :, 0]
+            global_indices = fixed_indices[:, :, 0] + level_offsets * codebook_size
+            self._language_feature_weights = coefficients.reshape(
+                coefficients.shape[0], -1
+            ).float()
+            self._language_feature_indices = global_indices.reshape(
+                global_indices.shape[0], -1
+            ).float()
+            return
         weights, indices = [], []
         for semantic_level in range(semantic_levels):
             level_weights, level_indices = get_weights_and_indices(

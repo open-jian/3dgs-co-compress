@@ -1,16 +1,19 @@
 # LangSplatV2_Cluno
 
 This project combines LangSplatV2's semantic representation with CoLaSplat's
-joint optimization, pruning, and SH quantization. The upstream LangSplatV2
-checkout remains separate at `../LangSplatV2`.
+joint optimization and pruning. Attribute compression uses C3DGS-style
+sensitivity-aware vector quantization adapted to the ADMM loop. The upstream
+LangSplatV2 checkout remains separate at `../LangSplatV2`.
 
 ## Joint CoLaSplat optimization (three scales, one model)
 
-`train_joint.py` ports the CoLaSplat opacity-pruning/SH-quantization ADMM stage
-to the LangSplatV2 representation. It stores the small, medium, and large
-semantic scales as three VQ heads in one Gaussian model. Geometry and opacity
-are shared, and every physical pruning event applies the same mask to all three
-semantic heads.
+`train_joint.py` jointly optimizes opacity sparsity and three C3DGS-style VQ
+blocks: color (DC and SH), normalized covariance, and semantic coefficients.
+Euclidean assignments and sensitivity-weighted centroid updates follow the
+C3DGS quantizer, while ADMM couples each projection to the rendering and
+semantic objectives. It stores the small, medium, and large semantic scales as
+three VQ heads in one Gaussian model. Geometry and opacity are shared, and every
+physical pruning event applies the same mask to all three semantic heads.
 
 If the released V2 `_1`, `_2`, and `_3` checkpoints are already trained, the
 recommended migration path is to merge them and start the CoLaSplat stage:
@@ -46,9 +49,12 @@ python train_joint.py \
 ```
 
 The joint checkpoint is
-`../../Output/langsplatv2_cluno/joint/3dovs/SCENE_NAME_0/chkpnt10000.pth` and the SH
-codebook/index artifact is `sh_quantization_10000.pth`. The released quick
-rasterizer can evaluate the single checkpoint directly, for example:
+`../../Output/langsplatv2_cluno/joint/3dovs/SCENE_NAME_0/chkpnt10000.pth` and its
+self-describing multi-block quantization sidecar is
+`sh_quantization_10000.pth`. The legacy filename and options such as
+`--rho_sh` are retained so existing launchers keep working; they no longer mean
+that only SH is quantized. The released quick rasterizer can evaluate the
+single checkpoint directly, for example:
 
 ```bash
 python eval_lerf.py ... --include_feature --quick_render \
