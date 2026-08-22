@@ -15,7 +15,21 @@ EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-/data2/jian/outputs/wacv27_experiments}"
 PYTHON_BIN="${PYTHON_BIN:-/home/jian/miniconda3/envs/langsplat_v2/bin/python}"
 PRETRAIN_ROOT="${PRETRAIN_ROOT:-${EXPERIMENT_ROOT}/clunogs_mvp/lerf_ovs}"
 SOURCE_CHECKPOINT="${4:-${PRETRAIN_ROOT}/${SCENE_NAME}/uncompressed/chkpnt${ITERATIONS}.pth}"
-RUN_ROOT="${EXPERIMENT_ROOT}/clunogs_mvp/lerf_ovs/${SCENE_NAME}/joint_semantic"
+RUN_ROOT="${RUN_ROOT:-${EXPERIMENT_ROOT}/clunogs_mvp/lerf_ovs/${SCENE_NAME}/joint_semantic}"
+
+# Explicit C3DGS-ADMM settings. Environment overrides make compression curves
+# reproducible without editing this launcher.
+RHO_COLOR="${RHO_COLOR:-0.0005}"
+RHO_COVARIANCE="${RHO_COVARIANCE:-0.0005}"
+RHO_SEMANTIC="${RHO_SEMANTIC:-0.0005}"
+COLOR_CODEBOOK_SIZE="${COLOR_CODEBOOK_SIZE:-256}"
+COVARIANCE_CODEBOOK_SIZE="${COVARIANCE_CODEBOOK_SIZE:-256}"
+SEMANTIC_CODEBOOK_SIZE="${SEMANTIC_CODEBOOK_SIZE:-256}"
+C3DGS_CODEBOOK_DECAY="${C3DGS_CODEBOOK_DECAY:-0.8}"
+C3DGS_SENSITIVITY_DECAY="${C3DGS_SENSITIVITY_DECAY:-0.9}"
+C3DGS_KEEP_RATIO="${C3DGS_KEEP_RATIO:-0.01}"
+C3DGS_REFINEMENT_STEPS="${C3DGS_REFINEMENT_STEPS:-3}"
+C3DGS_CHUNK_SIZE="${C3DGS_CHUNK_SIZE:-4096}"
 
 if (( ITERATIONS < 40 )); then
     echo "ITERATIONS must be at least 40 for the pruning/ADMM schedule" >&2
@@ -59,9 +73,18 @@ if [[ ! -f "${RUN_ROOT}/.complete" ]]; then
         --pruning_fraction1 0.00001 \
         --pruning_fraction2 0.5 \
         --rho_opacity 0.0005 \
-        --rho_sh 0.0005 \
+        --rho_sh "${RHO_COLOR}" \
+        --rho_covariance "${RHO_COVARIANCE}" \
+        --rho_semantic "${RHO_SEMANTIC}" \
         --freeze_sh_codebook_iter "${FREEZE_SH}" \
-        --sh_codebook_size 256 \
+        --sh_codebook_size "${COLOR_CODEBOOK_SIZE}" \
+        --gaussian_codebook_size "${COVARIANCE_CODEBOOK_SIZE}" \
+        --semantic_coefficient_codebook_size "${SEMANTIC_CODEBOOK_SIZE}" \
+        --c3dgs_codebook_decay "${C3DGS_CODEBOOK_DECAY}" \
+        --c3dgs_sensitivity_decay "${C3DGS_SENSITIVITY_DECAY}" \
+        --c3dgs_keep_ratio "${C3DGS_KEEP_RATIO}" \
+        --c3dgs_refinement_steps "${C3DGS_REFINEMENT_STEPS}" \
+        --c3dgs_chunk_size "${C3DGS_CHUNK_SIZE}" \
         --port "${PORT}"
     touch "${RUN_ROOT}/.complete"
 fi
@@ -77,6 +100,17 @@ printf '%s\n' \
     "admm_loss_coeff=1.0" \
     "pruning_fraction1=0.00001" \
     "pruning_fraction2=0.5" \
-    "sh_codebook_size=256" \
+    "quantization=c3dgs_sensitivity_aware_vq_admm" \
+    "color_codebook_size=${COLOR_CODEBOOK_SIZE}" \
+    "covariance_codebook_size=${COVARIANCE_CODEBOOK_SIZE}" \
+    "semantic_coefficient_codebook_size=${SEMANTIC_CODEBOOK_SIZE}" \
+    "rho_color=${RHO_COLOR}" \
+    "rho_covariance=${RHO_COVARIANCE}" \
+    "rho_semantic=${RHO_SEMANTIC}" \
+    "c3dgs_codebook_decay=${C3DGS_CODEBOOK_DECAY}" \
+    "c3dgs_sensitivity_decay=${C3DGS_SENSITIVITY_DECAY}" \
+    "c3dgs_keep_ratio=${C3DGS_KEEP_RATIO}" \
+    "c3dgs_refinement_steps=${C3DGS_REFINEMENT_STEPS}" \
+    "c3dgs_chunk_size=${C3DGS_CHUNK_SIZE}" \
     "stop_semantic_support_grad=false" \
     > "${RUN_ROOT}/protocol.txt"
