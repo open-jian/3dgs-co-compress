@@ -11,7 +11,7 @@ REPO=/data2/jian/WACV27_code/ClunoGS
 PYTHON=/home/jian/miniconda3/envs/langsplat_v2/bin/python
 DATA=/data2/jian/data/lerf_ovs
 SOURCE=/data2/jian/outputs/wacv27_experiments/clunogs_mvp/lerf_ovs/${SCENE}/uncompressed/chkpnt1000.pth
-OUTPUT_ROOT="${CONTROL_OUTPUT_ROOT:-/data2/jian/outputs/wacv27_section6_20260819}"
+OUTPUT_ROOT="${CONTROL_OUTPUT_ROOT:-/data2/jian/outputs/wacv27_section6_streamed_20260822}"
 MODEL=${OUTPUT_ROOT}/${VARIANT}/${SCENE}
 
 if [[ ! -f "${SOURCE}" ]]; then
@@ -25,6 +25,7 @@ fi
 
 mkdir -p "${MODEL}"
 cd "${REPO}"
+CODE_REVISION=$(git rev-parse HEAD)
 
 ADMM_START=$(( ITERATIONS / 20 ))
 SIMP_FIRST=$(( ITERATIONS / 40 ))
@@ -87,6 +88,10 @@ if [[ ! -f "${MODEL}/.complete" ]]; then
         --sh_codebook_size 256 \
         --port "${PORT}" \
         "${EXTRA[@]}"
+    test -s "${MODEL}/chkpnt${ITERATIONS}.pth"
+    if [[ ${VARIANT} == full_tracked || ${VARIANT} == no_sem_tracked ]]; then
+        test -s "${MODEL}/chkpnt${ITERATIONS}.pth.source_ids.pt"
+    fi
     touch "${MODEL}/.complete"
 fi
 
@@ -94,6 +99,9 @@ printf '%s\n' \
     "variant=${VARIANT}" \
     "scene=${SCENE}" \
     "iterations=${ITERATIONS}" \
+    "code_revision=${CODE_REVISION}" \
+    "backward_schedule=rgb_then_each_semantic_scale_then_admm" \
+    "max_live_rasterizer_graphs=1" \
     "source_checkpoint=${SOURCE}" \
     "pruning_fraction1=${PRUNE_FIRST}" \
     "pruning_fraction2=${PRUNE_SECOND}" \

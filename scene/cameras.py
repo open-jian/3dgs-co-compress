@@ -55,11 +55,17 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
     def get_language_feature(self, language_feature_dir, feature_level):
         return self.get_language_features(language_feature_dir, [feature_level])[0]
 
-    def get_language_features(self, language_feature_dir, feature_levels=(1, 2, 3)):
-        """Load several semantic scales with a single pair of NumPy reads."""
+    def iter_language_features(self, language_feature_dir, feature_levels=(1, 2, 3)):
+        """Yield semantic scales one at a time after a single pair of NumPy reads.
+
+        Materializing all three dense 512-D target maps on CUDA at once costs
+        several GiB for a LERF frame.  The training loop consumes this iterator
+        synchronously, so only the current scale needs to reside on the GPU.
+        """
         language_feature_name = os.path.join(language_feature_dir, self.image_name)
         seg_map = torch.from_numpy(np.load(language_feature_name + '_s.npy'))
         feature_map = torch.from_numpy(np.load(language_feature_name + '_f.npy'))
@@ -69,7 +75,6 @@ class Camera(nn.Module):
         y = y.reshape(-1, 1)
         seg = seg_map[:, y, x].squeeze(-1).long()
         valid = seg != -1
-        outputs = []
         for feature_level in feature_levels:
             if feature_level < 0 or feature_level >= seg.shape[0]:
                 raise ValueError("feature_level={}".format(feature_level))
@@ -86,8 +91,12 @@ class Camera(nn.Module):
             point_feature = point_feature.reshape(
                 self.image_height, self.image_width, -1
             ).permute(2, 0, 1)
-            outputs.append((point_feature.cuda(), level_mask.cuda()))
-        return outputs
+            yield point_feature.cuda(), level_mask.cuda()
+
+    def get_language_features(self, language_feature_dir, feature_levels=(1, 2, 3)):
+        """Materialize semantic scales for callers that explicitly need a list."""
+        return list(self.iter_language_features(language_feature_dir, feature_levels))
+
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

@@ -271,15 +271,21 @@ def training(
             pipe.debug = True
 
         language_enabled = opt.enable_language_loss and not args.no_language_loss
+        rgb_enabled = opt.enable_rgb_loss and not args.no_rgb_loss
+        zero_loss = background.new_zeros(())
         semantic_losses = []
-        rgb_image = None
+        language_loss = zero_loss
+        rgb_loss = zero_loss
+        rgb_metric_image = None
+        backward_performed = False
 
-        # With a semantic-to-support gradient stop, RGB needs its own normal
-        # render so L_rgb can still update the support.  If language supervision
-        # is disabled (the first stage of the sequential baseline), this single
-        # render also avoids three unnecessary semantic rasterizations.
-        if args.stop_semantic_support_grad or not language_enabled:
-            rgb_image = render(
+        # Keep RGB independent from the semantic passes in both the Full and
+        # stop-gradient arms.  Backpropagating it immediately releases the
+        # rasterizer's saved buffers before the first semantic scale is built.
+        # Using the same four-pass schedule in both arms also leaves
+        # ``detach_support`` as their only training-path difference.
+        if rgb_enabled:
+            rgb_render_package = render(
                 viewpoint,
                 gaussians,
                 pipe,
@@ -287,11 +293,26 @@ def training(
                 opt,
                 semantic_level=0,
                 detach_semantics=True,
-            )["render"]
+            )
+            rgb_image = rgb_render_package["render"]
+            target_rgb = viewpoint.original_image.cuda()
+            rgb_l1 = l1_loss(rgb_image, target_rgb)
+            rgb_loss = (
+                (1.0 - opt.lambda_dssim) * rgb_l1
+                + opt.lambda_dssim * (1.0 - ssim(rgb_image, target_rgb))
+            )
+            weighted_rgb_loss = opt.rgb_loss_coeff * rgb_loss
+            if weighted_rgb_loss.requires_grad:
+                weighted_rgb_loss.backward()
+                backward_performed = True
+            rgb_loss = rgb_loss.detach()
+            del weighted_rgb_loss, rgb_l1, rgb_image, rgb_render_package
 
         if language_enabled:
-            targets = viewpoint.get_language_features(dataset.lf_path, feature_levels)
-            for semantic_level, (target, mask) in enumerate(targets):
+            target_iter = viewpoint.iter_language_features(
+                dataset.lf_path, feature_levels
+            )
+            for semantic_level, (target, mask) in enumerate(target_iter):
                 render_package = render(
                     viewpoint,
                     gaussians,
@@ -301,8 +322,10 @@ def training(
                     semantic_level=semantic_level,
                     detach_support=args.stop_semantic_support_grad,
                 )
-                if rgb_image is None:
-                    rgb_image = render_package["render"]
+                if not rgb_enabled and rgb_metric_image is None:
+                    # Preserve the former semantic-only RGB diagnostic without
+                    # retaining this rasterization graph.
+                    rgb_metric_image = render_package["render"].detach()
                 weight_map = render_package["language_feature_weight_map"]
                 rvq_layers = gaussians._semantic_codebooks().shape[1]
                 rvq_layer = min(
@@ -315,31 +338,39 @@ def training(
                     prediction = prediction / (
                         prediction.norm(dim=0, keepdim=True) + 1e-10
                     )
-                semantic_losses.append(
-                    semantic_reconstruction_loss(
-                        prediction, target, mask, args.semantic_loss
-                    )
+                level_loss = semantic_reconstruction_loss(
+                    prediction, target, mask, args.semantic_loss
+                )
+                weighted_level_loss = opt.language_loss_coeff * level_loss
+                if weighted_level_loss.requires_grad:
+                    weighted_level_loss.backward()
+                    backward_performed = True
+                semantic_losses.append(level_loss.detach())
+                del (
+                    weighted_level_loss,
+                    level_loss,
+                    prediction,
+                    weight_map,
+                    render_package,
+                    target,
+                    mask,
                 )
             language_loss = torch.stack(semantic_losses).sum()
         else:
-            language_loss = rgb_image.new_zeros(())
-            semantic_losses = [
-                rgb_image.new_zeros(()) for _ in feature_levels
-            ]
-        target_rgb = viewpoint.original_image.cuda()
-        rgb_l1 = l1_loss(rgb_image, target_rgb)
-        rgb_loss = (
-            (1.0 - opt.lambda_dssim) * rgb_l1
-            + opt.lambda_dssim * (1.0 - ssim(rgb_image, target_rgb))
-        )
-        loss = rgb_image.new_zeros(())
-        if opt.enable_language_loss and not args.no_language_loss:
-            loss = loss + opt.language_loss_coeff * language_loss
-        if opt.enable_rgb_loss and not args.no_rgb_loss:
-            loss = loss + opt.rgb_loss_coeff * rgb_loss
+            semantic_losses = [zero_loss for _ in feature_levels]
 
-        opacity_admm_loss = rgb_image.new_zeros(())
-        sh_admm_loss = rgb_image.new_zeros(())
+        if not rgb_enabled and rgb_metric_image is not None:
+            with torch.no_grad():
+                target_rgb = viewpoint.original_image.cuda()
+                rgb_l1 = l1_loss(rgb_metric_image, target_rgb)
+                rgb_loss = (
+                    (1.0 - opt.lambda_dssim) * rgb_l1
+                    + opt.lambda_dssim * (1.0 - ssim(rgb_metric_image, target_rgb))
+                )
+            del rgb_l1, rgb_metric_image
+
+        opacity_admm_loss = zero_loss
+        sh_admm_loss = zero_loss
         if (
             admm is not None
             and opt.enable_admm_loss
@@ -350,12 +381,36 @@ def training(
             opacity_admm_loss = admm.opacity_loss()
             if not args.disable_sh_admm:
                 sh_admm_loss = admm.sh_loss()
+            weighted_admm_loss = opt.admm_loss_coeff * (
+                opacity_admm_loss + sh_admm_loss
+            )
+            if weighted_admm_loss.requires_grad:
+                weighted_admm_loss.backward()
+                backward_performed = True
+            opacity_admm_loss = opacity_admm_loss.detach()
+            sh_admm_loss = sh_admm_loss.detach()
+            del weighted_admm_loss
+
+        if not backward_performed:
+            raise RuntimeError("All training losses are disabled")
+
+        # Logging uses detached scalars.  No rasterization graph survives past
+        # its component backward call, which bounds peak memory to one pass.
+        loss = zero_loss
+        if language_enabled:
+            loss = loss + opt.language_loss_coeff * language_loss
+        if rgb_enabled:
+            loss = loss + opt.rgb_loss_coeff * rgb_loss
+        if (
+            admm is not None
+            and opt.enable_admm_loss
+            and not args.no_admm_loss
+            and iteration % opt.admm_interval == 0
+            and iteration <= opt.admm_end_iter
+        ):
             loss = loss + opt.admm_loss_coeff * (
                 opacity_admm_loss + sh_admm_loss
             )
-        if not loss.requires_grad:
-            raise RuntimeError("All training losses are disabled")
-        loss.backward()
 
         with torch.no_grad():
             if (
