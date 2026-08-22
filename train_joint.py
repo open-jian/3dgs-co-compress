@@ -267,6 +267,12 @@ def training(
                 sensitivity_decay=opt.c3dgs_sensitivity_decay,
                 keep_ratio=opt.c3dgs_keep_ratio,
                 refinement_steps=opt.c3dgs_refinement_steps,
+                covariance_refinement_steps=(
+                    opt.c3dgs_covariance_refinement_steps
+                ),
+                semantic_refinement_steps=(
+                    opt.c3dgs_semantic_refinement_steps
+                ),
                 chunk_size=opt.c3dgs_chunk_size,
                 enable_attribute_vq=not attribute_vq_disabled,
             )

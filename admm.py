@@ -53,6 +53,8 @@ class ADMM:
         sensitivity_decay=0.9,
         keep_ratio=0.0,
         refinement_steps=1,
+        covariance_refinement_steps=None,
+        semantic_refinement_steps=None,
         chunk_size=4096,
         enable_attribute_vq=True,
         device=None,
@@ -77,6 +79,16 @@ class ADMM:
         )
         semantic_clusters = (
             color_clusters if semantic_clusters is None else semantic_clusters
+        )
+        covariance_refinement_steps = (
+            refinement_steps
+            if covariance_refinement_steps is None
+            else covariance_refinement_steps
+        )
+        semantic_refinement_steps = (
+            refinement_steps
+            if semantic_refinement_steps is None
+            else semantic_refinement_steps
         )
 
         self.u_opacity = torch.zeros_like(
@@ -119,7 +131,7 @@ class ADMM:
             chunk_size=chunk_size,
             decay=codebook_decay,
             keep_ratio=keep_ratio,
-            refinement_steps=refinement_steps,
+            refinement_steps=covariance_refinement_steps,
             constraint="covariance",
         )
 
@@ -136,7 +148,7 @@ class ADMM:
                         chunk_size=chunk_size,
                         decay=codebook_decay,
                         keep_ratio=keep_ratio,
-                        refinement_steps=refinement_steps,
+                        refinement_steps=semantic_refinement_steps,
                         constraint="simplex",
                     )
                 )

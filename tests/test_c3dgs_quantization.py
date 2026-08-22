@@ -18,9 +18,30 @@ from compact_artifact import (
     load_compact_gaussians,
     validate_artifact,
 )
+from scene.gaussian_model import GaussianModel
 
 
 class C3DGSProjectorTest(unittest.TestCase):
+    def test_selected_semantic_softmax_matches_dense_normalization(self):
+        torch.manual_seed(7)
+        model = GaussianModel(3)
+        model._language_feature_logits = torch.nn.Parameter(
+            torch.randn(5, 3, 64)
+        )
+        model._language_feature_codebooks = torch.nn.Parameter(
+            torch.randn(3, 1, 64, 512)
+        )
+        model.freeze_semantic_indices(4)
+        actual = model.get_semantic_coefficients()
+        dense = torch.softmax(
+            model._language_feature_logits.reshape(5, 3, 1, 64), dim=-1
+        )
+        expected = torch.gather(
+            dense, -1, model._semantic_fixed_indices
+        )
+        expected = expected / expected.sum(dim=-1, keepdim=True)
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+
     def test_sensitivity_weights_centroid_refresh(self):
         projector = C3DGSSensitivityProjector(1, decay=0.0)
         projector.centers = torch.tensor([[5.0]])

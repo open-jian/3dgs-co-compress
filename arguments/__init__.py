@@ -125,7 +125,10 @@ class OptimizationParams(ParamGroup):
         self.c3dgs_codebook_decay = 0.8
         self.c3dgs_sensitivity_decay = 0.9
         self.c3dgs_keep_ratio = 0.01
-        self.c3dgs_refinement_steps = 3
+        # Match the released C3DGS color/covariance clustering schedules.
+        self.c3dgs_refinement_steps = 100
+        self.c3dgs_covariance_refinement_steps = 800
+        self.c3dgs_semantic_refinement_steps = 100
         self.c3dgs_chunk_size = 4096
         super().__init__(parser, "Optimization Parameters")
 

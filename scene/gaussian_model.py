@@ -256,13 +256,14 @@ class GaussianModel:
         reshaped = logits.reshape(
             logits.shape[0], logits.shape[1], rvq_layers, codebook_size
         )
-        probabilities = torch.softmax(reshaped, dim=-1)
-        coefficients = torch.gather(
-            probabilities, -1, self._semantic_fixed_indices
+        selected_logits = torch.gather(
+            reshaped, -1, self._semantic_fixed_indices
         )
-        return coefficients / coefficients.sum(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-10)
+        # Normalizing selected probabilities from a full softmax is exactly
+        # equivalent to applying softmax only to the selected logits. Avoiding
+        # the dense [N, level, RVQ, codebook] probability tensor saves roughly
+        # 1.5 GiB for the largest LERF scene.
+        return torch.softmax(selected_logits, dim=-1)
 
     @torch.no_grad()
     def materialize_semantic_coefficients(self, coefficients):

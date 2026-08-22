@@ -28,7 +28,9 @@ SEMANTIC_CODEBOOK_SIZE="${SEMANTIC_CODEBOOK_SIZE:-256}"
 C3DGS_CODEBOOK_DECAY="${C3DGS_CODEBOOK_DECAY:-0.8}"
 C3DGS_SENSITIVITY_DECAY="${C3DGS_SENSITIVITY_DECAY:-0.9}"
 C3DGS_KEEP_RATIO="${C3DGS_KEEP_RATIO:-0.01}"
-C3DGS_REFINEMENT_STEPS="${C3DGS_REFINEMENT_STEPS:-3}"
+C3DGS_REFINEMENT_STEPS="${C3DGS_REFINEMENT_STEPS:-100}"
+C3DGS_COVARIANCE_REFINEMENT_STEPS="${C3DGS_COVARIANCE_REFINEMENT_STEPS:-800}"
+C3DGS_SEMANTIC_REFINEMENT_STEPS="${C3DGS_SEMANTIC_REFINEMENT_STEPS:-100}"
 C3DGS_CHUNK_SIZE="${C3DGS_CHUNK_SIZE:-4096}"
 
 if (( ITERATIONS < 40 )); then
@@ -84,6 +86,8 @@ if [[ ! -f "${RUN_ROOT}/.complete" ]]; then
         --c3dgs_sensitivity_decay "${C3DGS_SENSITIVITY_DECAY}" \
         --c3dgs_keep_ratio "${C3DGS_KEEP_RATIO}" \
         --c3dgs_refinement_steps "${C3DGS_REFINEMENT_STEPS}" \
+        --c3dgs_covariance_refinement_steps "${C3DGS_COVARIANCE_REFINEMENT_STEPS}" \
+        --c3dgs_semantic_refinement_steps "${C3DGS_SEMANTIC_REFINEMENT_STEPS}" \
         --c3dgs_chunk_size "${C3DGS_CHUNK_SIZE}" \
         --port "${PORT}"
     touch "${RUN_ROOT}/.complete"
@@ -111,6 +115,8 @@ printf '%s\n' \
     "c3dgs_sensitivity_decay=${C3DGS_SENSITIVITY_DECAY}" \
     "c3dgs_keep_ratio=${C3DGS_KEEP_RATIO}" \
     "c3dgs_refinement_steps=${C3DGS_REFINEMENT_STEPS}" \
+    "c3dgs_covariance_refinement_steps=${C3DGS_COVARIANCE_REFINEMENT_STEPS}" \
+    "c3dgs_semantic_refinement_steps=${C3DGS_SEMANTIC_REFINEMENT_STEPS}" \
     "c3dgs_chunk_size=${C3DGS_CHUNK_SIZE}" \
     "stop_semantic_support_grad=false" \
     > "${RUN_ROOT}/protocol.txt"
