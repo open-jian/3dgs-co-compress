@@ -1,6 +1,7 @@
 """Export a standard 12-field RGB 3DGS checkpoint as a binary PLY."""
 
 import argparse
+import inspect
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +28,10 @@ def export_checkpoint(checkpoint_path, output_path, overwrite=False):
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"Refusing to overwrite existing PLY: {output_path}")
 
-    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    load_kwargs = {"map_location": "cpu"}
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        load_kwargs["weights_only"] = False
+    payload = torch.load(checkpoint_path, **load_kwargs)
     if not isinstance(payload, (tuple, list)) or len(payload) != 2:
         raise ValueError("Expected checkpoint payload (model_state, iteration)")
     state, iteration = payload

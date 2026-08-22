@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -23,7 +23,6 @@ from gaussian_renderer import GaussianModel
 from pathlib import Path
 import cv2
 import logging
-import gc
 
 from eval.openclip_encoder import OpenCLIPNetwork
 from scene import Scene
@@ -117,9 +116,9 @@ def eval_gt_lerfdata(json_folder: Union[str, Path] = None, ouput_path: Path = No
         img_ann = defaultdict(dict)
         with open(js_path, 'r') as f:
             gt_data = json.load(f)
-        
+
         h, w = gt_data['info']['height'], gt_data['info']['width']
-        idx = int(gt_data['info']['name'].split('_')[-1].split('.jpg')[0]) - 1 
+        idx = int(gt_data['info']['name'].split('_')[-1].split('.jpg')[0]) - 1
         for prompt_data in gt_data["objects"]:
             label = prompt_data['category']
             box = np.asarray(prompt_data['bbox']).reshape(-1)           # x1y1x2y2
@@ -131,7 +130,7 @@ def eval_gt_lerfdata(json_folder: Union[str, Path] = None, ouput_path: Path = No
             else:
                 img_ann[label]['bboxes'] = box
             img_ann[label]['mask'] = mask
-            
+
             # # save for visulsization
             save_path = ouput_path / 'gt' / gt_data['info']['name'].split('.jpg')[0] / f'{label}.jpg'
             save_path.parent.mkdir(exist_ok=True, parents=True)
@@ -149,16 +148,8 @@ def smooth_cuda(mask_pred:torch.Tensor):
 
 def segmentation_process_cuda(sem_map:torch.tensor, clip_model, thresh, img_ann,
                               prompts, visual_dir=None, rgb_img=None):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     valid_map = clip_model.get_max_across_quick(sem_map)
-    return segmentation_process_relevance_cuda(
-        valid_map, thresh, img_ann, prompts, visual_dir, rgb_img
-    )
-
-
-def segmentation_process_relevance_cuda(valid_map, thresh, img_ann,
-                                         prompts, visual_dir=None, rgb_img=None):
-    """Evaluate already-computed relevance maps without dense CLIP features."""
-    device = valid_map.device
     n_head, n_prompt, h, w = valid_map.shape
 
     # positive prompts
@@ -173,7 +164,7 @@ def segmentation_process_relevance_cuda(valid_map, thresh, img_ann,
             avg_pool = torch.nn.AvgPool2d(kernel_size=scale, stride=1, padding=14, count_include_pad=False).to(device)
             avg_filtered = avg_pool(valid_map[i][k].unsqueeze(0).unsqueeze(0))
             valid_map[i][k] = 0.5 * (avg_filtered.squeeze(0).squeeze(0) + valid_map[i][k])
-            
+
             # truncate the heatmap into mask
             output = valid_map[i][k]
             output = output - torch.min(output)
@@ -199,7 +190,7 @@ def segmentation_process_relevance_cuda(valid_map, thresh, img_ann,
             score = valid_map[i, k].max()
             score_lvl[i] = score
         chosen_lvl = torch.argmax(score_lvl)
-        
+
         chosen_iou_list.append(iou_lvl[chosen_lvl].cpu().numpy().item())
         chosen_lvl_list.append(chosen_lvl.cpu().numpy().item())
 
@@ -229,15 +220,10 @@ def segmentation_process_relevance_cuda(valid_map, thresh, img_ann,
     return chosen_iou_list, chosen_lvl_list
 
 def localization_process_cuda(sem_map:torch.tensor, clip_model, img_ann):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     valid_map = clip_model.get_max_across_quick(sem_map)
-    return localization_process_relevance_cuda(valid_map, img_ann)
-
-
-def localization_process_relevance_cuda(valid_map, img_ann):
-    """Evaluate localization from relevance maps without rebuilding features."""
-    device = valid_map.device
     n_head, n_prompt, h, w = valid_map.shape
-    
+
     # positive prompts
     select_level, scores_all = {}, {}
     acc_num = 0
@@ -247,7 +233,7 @@ def localization_process_relevance_cuda(valid_map, img_ann):
         scale = 29
         avg_pool = torch.nn.AvgPool2d(kernel_size=scale, stride=1, padding=14, count_include_pad=False).to(device)
         avg_filtered = avg_pool(select_output.unsqueeze(1)).squeeze(1)
-        
+
         score_lvl = torch.zeros((n_head,))
         coord_lvl = []
         for i in range(n_head):
@@ -261,14 +247,14 @@ def localization_process_relevance_cuda(valid_map, img_ann):
 
         scores_all[positives[k]] = score_lvl.tolist()
         select_level[positives[k]] = selec_head.item()
-        
+
         for box in img_ann[positives[k]]['bboxes'].reshape(-1, 4):
             flag = 0
             x1, y1, x2, y2 = box
             x_min, x_max = min(x1, x2), max(x1, x2)
             y_min, y_max = min(y1, y2), max(y1, y2)
             for cord_list in coord_final:
-                if (cord_list[1] >= x_min and cord_list[1] <= x_max and 
+                if (cord_list[1] >= x_min and cord_list[1] <= x_max and
                     cord_list[0] >= y_min and cord_list[0] <= y_max):
                     acc_num += 1
                     flag = 1
@@ -296,89 +282,6 @@ def render_language_feature_map_quick(gaussians:GaussianModel, view, pipeline, b
         language_feature_map = language_feature_map / (language_feature_map.norm(dim=1, keepdim=True) + 1e-10)
 
     return language_feature_map
-
-
-def render_language_coefficient_map_quick(
-        gaussians: GaussianModel, view, pipeline, background, args):
-    """Render only the 3x64 sparse-code coefficient maps.
-
-    The former evaluation path immediately expanded this tensor to a dense
-    [3, 512, H, W] float32 feature map.  Keeping the 64-dimensional code basis
-    is sufficient for exact chunked CLIP scoring and avoids two multi-GiB
-    feature-map allocations.
-    """
-    with torch.no_grad():
-        output = render(view, gaussians, pipeline, background, args)
-        coefficient_map = output["language_feature_weight_map"]
-        _, height, width = coefficient_map.shape
-        coefficient_map = coefficient_map.view(3, 64, height, width)
-        del output
-    return coefficient_map
-
-
-def relevance_from_coefficients(
-        coefficient_map, codebooks, positive_embeddings, positive_index,
-        negative_embeddings, pixel_chunk_size):
-    """Reproduce normalized 512-D CLIP scoring in bounded pixel chunks.
-
-    This deliberately reconstructs at most ``pixel_chunk_size`` feature
-    vectors at once.  It follows the old evaluator's order of operations:
-    codebook reconstruction, L2 normalization, positive/negative dot products,
-    temperature-10 two-way softmax, then the minimum positive probability over
-    the four negative phrases.
-    """
-    if coefficient_map.shape[:2] != (3, 64):
-        raise ValueError("expected coefficient map [3,64,H,W]")
-    if codebooks.shape != (3, 64, 512):
-        raise ValueError("expected codebooks [3,64,512]")
-    if positive_embeddings.ndim != 2 or positive_embeddings.shape[1] != 512:
-        raise ValueError("expected positive embeddings [P,512]")
-    if positive_index < 0 or positive_index >= positive_embeddings.shape[0]:
-        raise ValueError("positive_index is outside the positive embedding batch")
-    if negative_embeddings.ndim != 2 or negative_embeddings.shape[1] != 512:
-        raise ValueError("expected negative embeddings [N,512]")
-    if pixel_chunk_size <= 0:
-        raise ValueError("pixel_chunk_size must be positive")
-
-    levels, _, height, width = coefficient_map.shape
-    pixel_count = height * width
-    phrases = torch.cat((positive_embeddings, negative_embeddings), dim=0)
-    phrases = phrases.to(device=coefficient_map.device, dtype=coefficient_map.dtype)
-    relevance = torch.empty(
-        (levels, 1, pixel_count),
-        dtype=coefficient_map.dtype,
-        device=coefficient_map.device,
-    )
-
-    for level in range(levels):
-        coefficients = coefficient_map[level].view(64, pixel_count)
-        level_codebook = codebooks[level].to(coefficient_map.dtype)
-        for start in range(0, pixel_count, pixel_chunk_size):
-            end = min(start + pixel_chunk_size, pixel_count)
-            # Keep the same operand layout and einsum equations as the former
-            # full-image path.  Only the pixel dimension is chunked.
-            features = torch.einsum(
-                "dk,kn->dn",
-                level_codebook.transpose(0, 1),
-                coefficients[:, start:end],
-            )
-            features = features / (features.norm(dim=0, keepdim=True) + 1e-10)
-            similarities = torch.einsum(
-                "qc,pc->qp", features.transpose(0, 1).contiguous(), phrases
-            )
-            positive_count = positive_embeddings.shape[0]
-            positive = similarities[:, positive_index:positive_index + 1]
-            negatives = similarities[:, positive_count:]
-            pair_logits = torch.stack(
-                (positive.expand_as(negatives), negatives), dim=-1
-            )
-            positive_probabilities = torch.softmax(
-                10.0 * pair_logits, dim=-1
-            )[..., 0]
-            relevance[level, 0, start:end] = positive_probabilities.min(dim=1).values
-            del features, similarities, pair_logits, positive_probabilities
-
-    return relevance.view(levels, 1, height, width)
 
 
 def evaluate(dataset:ModelParams, pipeline:PipelineParams, args):
@@ -419,7 +322,7 @@ def evaluate(dataset:ModelParams, pipeline:PipelineParams, args):
             checkpoint = os.path.join(args.ckpt_paths[level_idx], f'chkpnt{args.checkpoint}.pth')
             (model_params, first_iter) = torch.load(checkpoint)
             gaussians.restore(model_params, args, mode='test')
-            
+
             language_feature_image = render_language_feature_map(gaussians, view, pipeline, background, args)
             language_feature_image = language_feature_image / (language_feature_image.norm(dim=0, keepdim=True) + 1e-10)
             language_feature_image = language_feature_image.detach()
@@ -429,7 +332,7 @@ def evaluate(dataset:ModelParams, pipeline:PipelineParams, args):
         restored_feat = torch.stack(sem_feat, dim=0)
         img_ann = gt_ann[f'{idx}']
         clip_model.set_positives(list(img_ann.keys()))
-        
+
         c_iou_list, c_lvl = segmentation_process_cuda(
             restored_feat, clip_model, args.mask_thresh, img_ann,
             list(img_ann.keys()),
@@ -467,32 +370,12 @@ def evaluate_quick(dataset:ModelParams, pipeline:PipelineParams, args):
     # load test data
     gt_ann, image_shape, image_paths = eval_gt_lerfdata(Path(args.json_folder), Path(args.output_path))
     eval_index_list = [int(idx) for idx in list(gt_ann.keys())]
-
-    # Encode every distinct prompt once, then release the text encoder before
-    # loading cameras and Gaussians.  Text embeddings are the only part of
-    # OpenCLIP needed by the rendered-view evaluator.
-    text_encode_start = time.perf_counter()
     clip_model = OpenCLIPNetwork(device)
-    view_positive_embeddings = {}
-    for annotation_index, image_annotation in gt_ann.items():
-        clip_model.set_positives(list(image_annotation.keys()))
-        view_positive_embeddings[annotation_index] = (
-            clip_model.pos_embeds.detach().clone()
-        )
-    torch.cuda.synchronize()
-    negative_embeddings = clip_model.neg_embeds.detach().clone()
-    text_encode_seconds = time.perf_counter() - text_encode_start
-    del clip_model
-    gc.collect()
-    torch.cuda.empty_cache()
 
     chosen_iou_all, chosen_lvl_list = [], []
     acc_num = 0
 
     load_start = time.perf_counter()
-    # Evaluation only needs camera matrices.  Keeping every source RGB image
-    # on CUDA made memory scale with the number of training cameras.
-    dataset.data_device = "cpu"
     combined_gaussians = GaussianModel(dataset.sh_degree)
     dataset.model_path = (
         os.path.dirname(os.path.abspath(args.semantic_sidecar))
@@ -517,16 +400,9 @@ def evaluate_quick(dataset:ModelParams, pipeline:PipelineParams, args):
         )
     elif args.compact_artifact:
         from compact_artifact import load_compact_gaussians
-        camera_placeholder = combined_gaussians
         combined_gaussians, _compact_bundle = load_compact_gaussians(
             args.compact_artifact, device="cuda"
         )
-        # Scene created a small initialization cloud solely while loading the
-        # cameras.  It is not part of the compact deployment.
-        scene.gaussians = None
-        del camera_placeholder
-        gc.collect()
-        torch.cuda.empty_cache()
     else:
         checkpoint = (
             args.joint_checkpoint
@@ -555,69 +431,54 @@ def evaluate_quick(dataset:ModelParams, pipeline:PipelineParams, args):
         combined_gaussians._language_feature_indices = torch.cat(language_feature_indices, dim=1)
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-    quick_codebooks = combined_gaussians.get_quick_codebooks()
     torch.cuda.synchronize()
     representation_load_seconds = time.perf_counter() - load_start
+
+    # Keep the deployed representation resident, but exclude checkpoint and
+    # artifact deserialization from the inference-memory boundary.
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    baseline_memory_allocated_bytes = torch.cuda.memory_allocated()
+    baseline_memory_reserved_bytes = torch.cuda.memory_reserved()
     render_seconds = []
     query_seconds = []
 
     for i, idx in enumerate(tqdm(eval_index_list)):
-        rgb_img = None
-        if args.save_visuals:
-            rgb_array = cv2.imread(image_paths[i])[..., ::-1]
-            rgb_array = (rgb_array / 255.0).astype(np.float32)
-            # Visualization code copies this array to CPU in any case.
-            rgb_img = torch.from_numpy(rgb_array)
+        rgb_img = cv2.imread(image_paths[i])[..., ::-1]
+        rgb_img = (rgb_img / 255.0).astype(np.float32)
+        rgb_img = torch.from_numpy(rgb_img).to(device)
 
         image_name = Path(args.output_path) / f'{idx+1:0>5}'
         image_name.mkdir(exist_ok=True, parents=True)
 
         view = views[idx]
         img_ann = gt_ann[f'{idx}']
+        query_start = time.perf_counter()
+        clip_model.set_positives(list(img_ann.keys()))
+        torch.cuda.synchronize()
+        query_embedding_seconds = time.perf_counter() - query_start
         render_start = time.perf_counter()
-        coefficient_map = render_language_coefficient_map_quick(
-            combined_gaussians, view, pipeline, background, args
-        )
+        language_feature_image = render_language_feature_map_quick(combined_gaussians, view, pipeline, background, args)
         torch.cuda.synchronize()
         render_seconds.append(time.perf_counter() - render_start)
+        restored_feat = language_feature_image.permute(0, 2, 3, 1)
         query_start = time.perf_counter()
-
-        # Batch size one is intentional: it minimizes peak memory and matches
-        # the interactive query setting.  Each result is consumed before the
-        # next text query is evaluated.
-        positive_batch = view_positive_embeddings[str(idx)]
-        for prompt_index, prompt in enumerate(img_ann.keys()):
-            relevance = relevance_from_coefficients(
-                coefficient_map,
-                quick_codebooks,
-                positive_batch,
-                prompt_index,
-                negative_embeddings,
-                args.relevance_pixel_chunk,
-            )
-            one_prompt_annotation = {prompt: img_ann[prompt]}
-            # Localization consumes the unsmoothed relevance.  Segmentation
-            # then applies the same in-place 29px filter as the old evaluator.
-            acc_num += localization_process_relevance_cuda(
-                relevance, one_prompt_annotation
-            )
-            c_iou_list, c_lvl = segmentation_process_relevance_cuda(
-                relevance,
-                args.mask_thresh,
-                one_prompt_annotation,
-                [prompt],
-                image_name / "predictions" if args.save_visuals else None,
-                rgb_img,
-            )
-            chosen_iou_all.extend(c_iou_list)
-            chosen_lvl_list.extend(c_lvl)
-            del relevance
-
+        c_iou_list, c_lvl = segmentation_process_cuda(
+            restored_feat, clip_model, args.mask_thresh, img_ann,
+            list(img_ann.keys()),
+            image_name / "predictions" if args.save_visuals else None,
+            rgb_img,
+        )
+        chosen_iou_all.extend(c_iou_list)
+        chosen_lvl_list.extend(c_lvl)
+        acc_num_img = localization_process_cuda(restored_feat, clip_model, img_ann)
         torch.cuda.synchronize()
-        query_seconds.append(time.perf_counter() - query_start)
-        del coefficient_map
-        if rgb_img is not None:
-            del rgb_img
+        query_seconds.append(query_embedding_seconds + time.perf_counter() - query_start)
+        acc_num += acc_num_img
+        # Large projected Gaussians can make one full-resolution feature map
+        # tens of GiB.  Drop per-view tensors before rendering the next view so
+        # the allocator can reuse those blocks instead of retaining two views.
+        del restored_feat, language_feature_image, rgb_img
         torch.cuda.empty_cache()
 
     logger.info(f'checkpoint: {args.checkpoint}')
@@ -634,12 +495,18 @@ def evaluate_quick(dataset:ModelParams, pipeline:PipelineParams, args):
     logger.info("Localization accuracy: " + f'{acc:.4f}')
 
     timing = {
-        "text_encode_seconds": float(text_encode_seconds),
         "representation_load_seconds": float(representation_load_seconds),
         "semantic_render_ms_per_view": float(1000.0 * sum(render_seconds) / len(render_seconds)),
         "query_batch_ms_per_view": float(1000.0 * sum(query_seconds) / len(query_seconds)),
         "query_ms_per_prompt": float(1000.0 * sum(query_seconds) / total_bboxes),
         "annotated_views": int(len(eval_index_list)),
+        "memory": {
+            "scope": "resident deployment plus one complete common LERF query path; maximum across annotated views",
+            "baseline_memory_allocated_bytes": int(baseline_memory_allocated_bytes),
+            "baseline_memory_reserved_bytes": int(baseline_memory_reserved_bytes),
+            "peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+            "peak_memory_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+        },
     }
     save_lerf_metrics(
         args, chosen_iou_all, chosen_lvl_list, acc_num, total_bboxes, timing
@@ -652,8 +519,8 @@ def seed_everything(seed_value):
     np.random.seed(seed_value)
     torch.manual_seed(seed_value)
     os.environ['PYTHONHASHSEED'] = str(seed_value)
-    
-    if torch.cuda.is_available(): 
+
+    if torch.cuda.is_available():
         torch.cuda.manual_seed(seed_value)
         torch.cuda.manual_seed_all(seed_value)
         torch.backends.cudnn.deterministic = True
@@ -686,12 +553,6 @@ if __name__ == "__main__":
     parser.add_argument("--mask_thresh", type=float, default=0.4)
     parser.add_argument("--checkpoint", type=int, default=10000)
     parser.add_argument("--topk", type=int, default=1)
-    parser.add_argument(
-        "--relevance_pixel_chunk",
-        type=int,
-        default=8192,
-        help="maximum pixels whose 512-D features are reconstructed at once",
-    )
     parser.add_argument("--save_visuals", action="store_true")
     #------------------------------------------------------------
 
@@ -724,14 +585,14 @@ if __name__ == "__main__":
     args.ckpt_paths = [os.path.join(args.ckpt_root_path, args.dataset_name + f"_{args.index}_{level}") for level in [1, 2, 3]]
     args.output_path = os.path.join(args.output_dir, args.dataset_name + f"_{args.index}")
     args.json_folder = os.path.join(args.json_folder, args.dataset_name)
-    
+
     os.makedirs(args.output_path, exist_ok=True)
     # NOTE logger
     timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
     os.makedirs(args.output_path, exist_ok=True)
     log_file = os.path.join(args.output_path, f'{timestamp}.log')
     logger = get_logger(f'{args.dataset_name}', log_file=log_file, log_level=logging.INFO)
-    
+
     safe_state(args.quiet)
     print(args)
     with torch.no_grad():

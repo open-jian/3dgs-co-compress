@@ -21,12 +21,21 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--images", default="images")
     parser.add_argument("--eval", action="store_true")
+    parser.add_argument(
+        "--loader",
+        choices=("auto", "colmap", "scannet"),
+        default="auto",
+        help="Dataset loader used only to recover the scene normalization radius.",
+    )
     args = parser.parse_args()
 
     if os.path.exists(args.output):
         raise FileExistsError("Refusing to overwrite {}".format(args.output))
 
-    if "scannet" in os.path.abspath(args.source).lower():
+    use_scannet = args.loader == "scannet" or (
+        args.loader == "auto" and "scannet" in os.path.abspath(args.source).lower()
+    )
+    if use_scannet:
         scene_info = readScanNetInfo(args.source, False, args.eval)
     else:
         scene_info = readColmapSceneInfo(args.source, args.images, args.eval)

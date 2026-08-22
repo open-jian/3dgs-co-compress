@@ -130,11 +130,11 @@ def initialize_lineage(
             "resumed_from_sidecar_sha256": sha256_file(input_sidecar),
         }
     else:
-        if len(start_params) != 12:
-            raise ValueError(
-                "A semantic/joint checkpoint requires --source_id_input; its original "
-                "row IDs cannot be inferred after possible pruning."
-            )
+        # With no incoming sidecar, the explicitly selected start checkpoint
+        # defines the host row order for this controlled run.  This is also
+        # valid for an unpruned semantic host: IDs are local to that host and
+        # do not claim ancestry before it.  Resuming a previously tracked run
+        # still requires input_sidecar so its earlier origin is preserved.
         origin_checkpoint = os.path.abspath(origin_checkpoint or start_checkpoint)
         origin_params, _ = load_checkpoint(origin_checkpoint)
         geometry_exact = compare_geometry(start_params, origin_params)

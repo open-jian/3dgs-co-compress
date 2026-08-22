@@ -134,7 +134,11 @@ class GaussianModel:
             denom,
             opt_dict, 
             self.spatial_lr_scale) = model_args
-            if not training_args.include_feature:
+            if (
+                not training_args.include_feature
+                and isinstance(opt_dict, dict)
+                and "param_groups" in opt_dict
+            ):
                 self.optimizer.load_state_dict(opt_dict)
         
         if mode == 'train':

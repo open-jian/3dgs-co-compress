@@ -117,6 +117,10 @@ def training(
         )
     if args.topk <= 0 or args.topk > opt.codebook_size:
         raise ValueError("topk must be in [1, codebook_size]")
+    if args.rgb_only:
+        opt.include_feature = False
+        args.no_language_loss = True
+        print("RGB-only mode: semantic tensors and language supervision are disabled")
 
     opt.semantic_level_num = len(feature_levels)
     opt.joint_optimize = not args.semantic_only and not args.support_only
@@ -170,6 +174,14 @@ def training(
             first_iter = 0
     elif opt.include_feature:
         raise ValueError("--start_checkpoint must point to an RGB or joint checkpoint")
+
+    if args.freeze_higher_order_sh:
+        for parameter_group in gaussians.optimizer.param_groups:
+            if parameter_group.get("name") == "f_rest":
+                parameter_group["lr"] = 0.0
+                break
+        else:
+            raise RuntimeError("higher-order SH optimizer group is missing")
 
     if args.track_source_ids:
         if not checkpoint:
@@ -235,13 +247,18 @@ def training(
                     opt.sh_codebook_size,
                 )
                 admm.update_opacity(opt.pruning_fraction2, update_dual=False)
-                admm.update_sh(update_dual=False, update_centers=True)
+                if not args.disable_sh_admm:
+                    admm.update_sh(update_dual=False, update_centers=True)
             elif iteration % opt.admm_interval == 0:
-                admm.update_opacity(opt.pruning_fraction2, update_dual=True)
-                admm.update_sh(
-                    update_dual=True,
-                    update_centers=iteration < opt.freeze_sh_codebook_iter,
+                update_dual = not args.disable_dual_updates
+                admm.update_opacity(
+                    opt.pruning_fraction2, update_dual=update_dual
                 )
+                if not args.disable_sh_admm:
+                    admm.update_sh(
+                        update_dual=update_dual,
+                        update_centers=iteration < opt.freeze_sh_codebook_iter,
+                    )
 
         gaussians.update_learning_rate(iteration)
         if iteration % 1000 == 0:
@@ -331,7 +348,8 @@ def training(
             and iteration <= opt.admm_end_iter
         ):
             opacity_admm_loss = admm.opacity_loss()
-            sh_admm_loss = admm.sh_loss()
+            if not args.disable_sh_admm:
+                sh_admm_loss = admm.sh_loss()
             loss = loss + opt.admm_loss_coeff * (
                 opacity_admm_loss + sh_admm_loss
             )
@@ -409,11 +427,22 @@ def training(
                 checkpoint_path = os.path.join(
                     scene.model_path, "chkpnt{}.pth".format(iteration)
                 )
+                if args.materialize_sh_projection_at_checkpoint:
+                    if admm is None or args.disable_sh_admm:
+                        raise RuntimeError(
+                            "--materialize_sh_projection_at_checkpoint requires "
+                            "an initialized SH-ADMM projector"
+                        )
+                    projected_sh = admm.sh_projector.project(
+                        gaussians._features_rest, update_centers=False
+                    )
+                    gaussians._features_rest.copy_(projected_sh)
                 torch.save(
                     (gaussians.capture(opt.include_feature), iteration),
                     checkpoint_path,
                 )
-                save_sh_quantization(admm, scene.model_path, iteration)
+                if not args.disable_sh_admm:
+                    save_sh_quantization(admm, scene.model_path, iteration)
                 if args.track_source_ids:
                     save_lineage_sidecar(
                         gaussians,
@@ -463,6 +492,12 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--feature_levels", nargs=3, type=int, default=[1, 2, 3])
+    parser.add_argument(
+        "--rgb_only",
+        action="store_true",
+        default=False,
+        help="disable semantic tensor initialization and language supervision",
+    )
     parser.add_argument("--semantic_only", action="store_true", default=False)
     parser.add_argument(
         "--support_only",
@@ -481,6 +516,42 @@ if __name__ == "__main__":
     parser.add_argument("--no_rgb_loss", action="store_true", default=False)
     parser.add_argument("--no_language_loss", action="store_true", default=False)
     parser.add_argument("--no_admm_loss", action="store_true", default=False)
+    parser.add_argument(
+        "--disable_dual_updates",
+        action="store_true",
+        default=False,
+        help=(
+            "keep the ADMM dual variables fixed at zero while retaining the "
+            "same opacity/SH projections and penalty terms"
+        ),
+    )
+    parser.add_argument(
+        "--disable_sh_admm",
+        action="store_true",
+        default=False,
+        help=(
+            "disable the RGB-SH quantization constraint while retaining "
+            "opacity sparsification; used by the sparsification-only control"
+        ),
+    )
+    parser.add_argument(
+        "--materialize_sh_projection_at_checkpoint",
+        action="store_true",
+        default=False,
+        help=(
+            "replace saved higher-order SH values by their final projected "
+            "codebook entries; intended for a VQ-first sequential stage"
+        ),
+    )
+    parser.add_argument(
+        "--freeze_higher_order_sh",
+        action="store_true",
+        default=False,
+        help=(
+            "set the higher-order SH optimizer group to zero learning rate; "
+            "used after a materialized VQ-first stage"
+        ),
+    )
     parser.add_argument(
         "--stop_semantic_support_grad",
         action="store_true",
